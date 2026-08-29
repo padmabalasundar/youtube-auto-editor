@@ -1,4 +1,4 @@
-# MicroSaaS Template
+# YouTube Auto Editor Agent
 
 > **Clone. Define. Build.** Full-stack SaaS in minutes.
 
