@@ -18,6 +18,10 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        # .env also carries VITE_API_URL for the frontend's convenience (see
+        # .env.example) - ignore vars the backend doesn't define rather than
+        # forbidding them (pydantic-settings v2 defaults to "forbid").
+        extra = "ignore"
 
 
 settings = Settings()
