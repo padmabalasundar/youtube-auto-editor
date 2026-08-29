@@ -9,19 +9,16 @@ sqlalchemy>=2.0.25
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
 python-dotenv>=1.0.0
+# Required for FastAPI's File(...)/UploadFile (multipart form parsing).
+python-multipart>=0.0.9
 
-# --- LLM ---
-# >=1.0.0 required for client.messages.parse()/output_format (structured outputs)
-anthropic>=1.0.0
-
-# --- Video download / transcripts ---
-yt-dlp>=2024.3.10
-youtube-transcript-api>=0.6.2
-
-# Whisper fallback for transcripts when no captions are available.
-# NOTE: this pulls in torch and is heavy (multi-GB download); install
-# separately/locally when transcript fallback is actually needed.
+# --- Transcription ---
+# Whisper transcribes every upload locally (no YouTube captions to fall back
+# from). NOTE: pulls in torch and is heavy (multi-GB download).
 openai-whisper>=20231117
+
+# ffmpeg and ffprobe are required system binaries (not pip packages) - must
+# be on PATH. Used for clip cutting/captioning and duration probing.
 
 # --- Dev / lint / test ---
 ruff>=0.2.0

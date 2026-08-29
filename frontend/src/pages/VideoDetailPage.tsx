@@ -1,7 +1,8 @@
-import { Link, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
 import { StatusBadge } from '../components/ui/StatusBadge';
-import { useVideo } from '../hooks/useVideos';
+import { useRetryVideo, useVideo } from '../hooks/useVideos';
 import type { Clip } from '../types';
 
 const CLIP_TYPE_LABELS: Record<Clip['type'], string> = {
@@ -20,6 +21,15 @@ export const VideoDetailPage = () => {
   const { id } = useParams<{ id: string }>();
   const videoId = Number(id);
   const { data: video, isLoading, isError } = useVideo(videoId);
+  const navigate = useNavigate();
+  const retryVideo = useRetryVideo();
+
+  const handleRetry = () => {
+    if (!video || retryVideo.isPending) return;
+    retryVideo.mutate(video.id, {
+      onSuccess: (newVideo) => navigate(`/videos/${newVideo.id}`),
+    });
+  };
 
   return (
     <div>
@@ -43,7 +53,7 @@ export const VideoDetailPage = () => {
       {video && (
         <>
           <div className="mt-4 flex flex-wrap items-center gap-3">
-            <h1 className="text-2xl font-semibold">{video.title ?? video.youtube_url}</h1>
+            <h1 className="text-2xl font-semibold">{video.title ?? video.original_filename}</h1>
             <StatusBadge status={video.status} />
           </div>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
@@ -55,7 +65,21 @@ export const VideoDetailPage = () => {
               role="alert"
               className="mt-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
             >
-              {video.error_message ?? 'Processing failed for an unknown reason.'}
+              <p>{video.error_message ?? 'Processing failed for an unknown reason.'}</p>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={handleRetry}
+                disabled={retryVideo.isPending}
+                className="mt-3"
+              >
+                {retryVideo.isPending ? 'Retrying...' : 'Try again'}
+              </Button>
+              {retryVideo.isError && (
+                <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                  {retryVideo.error.message}
+                </p>
+              )}
             </div>
           )}
 

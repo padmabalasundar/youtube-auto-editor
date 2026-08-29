@@ -15,8 +15,8 @@ export interface Clip {
 
 export interface Video {
   id: number;
-  youtube_url: string;
-  youtube_id: string;
+  original_filename: string;
+  storage_key: string;
   title: string | null;
   status: VideoStatus;
   error_message: string | null;

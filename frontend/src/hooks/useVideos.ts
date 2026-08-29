@@ -27,10 +27,6 @@ export const useVideo = (id: number) => {
   });
 };
 
-interface CreateVideoInput {
-  youtube_url: string;
-}
-
 const extractErrorMessage = (error: unknown): string => {
   if (axios.isAxiosError(error)) {
     const detail = (error.response?.data as { detail?: string } | undefined)?.detail;
@@ -45,9 +41,29 @@ export const useCreateVideo = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (input: CreateVideoInput): Promise<Video> => {
+    mutationFn: async (file: File): Promise<Video> => {
+      const formData = new FormData();
+      formData.append('file', file);
       try {
-        const { data } = await api.post<Video>('/videos', input);
+        const { data } = await api.post<Video>('/videos', formData);
+        return data;
+      } catch (error) {
+        throw new Error(extractErrorMessage(error));
+      }
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['videos'] });
+    },
+  });
+};
+
+export const useRetryVideo = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (videoId: number): Promise<Video> => {
+      try {
+        const { data } = await api.post<Video>(`/videos/${videoId}/retry`);
         return data;
       } catch (error) {
         throw new Error(extractErrorMessage(error));
