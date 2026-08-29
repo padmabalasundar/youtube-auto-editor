@@ -1,0 +1,30 @@
+# --- Web framework ---
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# --- Database ---
+sqlalchemy>=2.0.25
+
+# --- Settings / config ---
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# --- LLM ---
+# >=1.0.0 required for client.messages.parse()/output_format (structured outputs)
+anthropic>=1.0.0
+
+# --- Video download / transcripts ---
+yt-dlp>=2024.3.10
+youtube-transcript-api>=0.6.2
+
+# Whisper fallback for transcripts when no captions are available.
+# NOTE: this pulls in torch and is heavy (multi-GB download); install
+# separately/locally when transcript fallback is actually needed.
+openai-whisper>=20231117
+
+# --- Dev / lint / test ---
+ruff>=0.2.0
+pytest>=7.4.0
+pytest-cov>=4.1.0
+httpx>=0.26.0
