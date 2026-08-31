@@ -13,6 +13,7 @@ from app import main as app_main
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
+from app.routers import videos as videos_router
 
 
 @pytest.fixture(autouse=True)
@@ -43,11 +44,12 @@ def db():
 @pytest.fixture
 def client(db, monkeypatch):
     app.dependency_overrides[get_db] = lambda: db
-    # app.main.on_startup() calls SessionLocal() directly (it runs outside any
-    # request, so it can't use the Depends(get_db) override above) - without
-    # this, TestClient's startup event would hit the real production
-    # database file instead of the in-memory test one.
+    # app.main.on_startup() and the pipeline's background-thread runner both
+    # call SessionLocal() directly (outside any request, so neither can use
+    # the Depends(get_db) override above) - without this, they'd hit the real
+    # production database file instead of the in-memory test one.
     monkeypatch.setattr(app_main, "SessionLocal", TestSession)
+    monkeypatch.setattr(videos_router, "SessionLocal", TestSession)
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()

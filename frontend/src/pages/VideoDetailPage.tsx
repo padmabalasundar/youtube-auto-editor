@@ -1,6 +1,7 @@
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
+import { ProgressLoader } from '../components/ui/ProgressLoader';
 import { StatusBadge } from '../components/ui/StatusBadge';
 import { useRetryVideo, useVideo } from '../hooks/useVideos';
 import type { Clip } from '../types';
@@ -54,7 +55,7 @@ export const VideoDetailPage = () => {
         <>
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <h1 className="text-2xl font-semibold">{video.title ?? video.original_filename}</h1>
-            <StatusBadge status={video.status} />
+            <StatusBadge status={video.status} percent={video.progress_percent} />
           </div>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
             Created {new Date(video.created_at).toLocaleString()}
@@ -84,35 +85,34 @@ export const VideoDetailPage = () => {
           )}
 
           {(video.status === 'pending' || video.status === 'processing') && (
-            <div className="mt-6 flex items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-700 dark:border-blue-900 dark:bg-blue-950 dark:text-blue-300">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
-              Processing video... this page will update automatically.
+            <div className="mt-6">
+              <ProgressLoader stage={video.progress_stage} percent={video.progress_percent} />
             </div>
           )}
 
           {video.status === 'done' && (
-            <div className="mt-6 flex flex-col gap-4">
+            <div className="mt-6 grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
               {video.clips.length === 0 && (
-                <p className="text-sm text-gray-500 dark:text-gray-400">
+                <p className="col-span-full text-sm text-gray-500 dark:text-gray-400">
                   No clips were generated for this video.
                 </p>
               )}
               {video.clips.map((clip) => (
-                <Card key={clip.id}>
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h2 className="font-medium">{clip.hook_title}</h2>
-                    <span className="inline-flex items-center rounded-full bg-indigo-100 px-2.5 py-0.5 text-xs font-medium text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">
-                      {CLIP_TYPE_LABELS[clip.type]}
-                    </span>
+                <Card key={clip.id} className="flex flex-col">
+                  <video
+                    controls
+                    className="aspect-[9/16] w-full rounded-lg bg-black object-cover"
+                    src={`${import.meta.env.VITE_API_URL}/output/${clip.file_path}`}
+                  />
+                  <div className="mt-2 flex items-start justify-between gap-1">
+                    <h2 className="truncate text-sm font-medium">{clip.hook_title}</h2>
                   </div>
+                  <span className="mt-1 inline-flex w-fit items-center rounded-full bg-indigo-100 px-2 py-0.5 text-[11px] font-medium text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">
+                    {CLIP_TYPE_LABELS[clip.type]}
+                  </span>
                   <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
                     {formatTime(clip.start_time)} &ndash; {formatTime(clip.end_time)}
                   </p>
-                  <video
-                    controls
-                    className="mt-3 w-full rounded-lg bg-black"
-                    src={`${import.meta.env.VITE_API_URL}/output/${clip.file_path}`}
-                  />
                 </Card>
               ))}
             </div>

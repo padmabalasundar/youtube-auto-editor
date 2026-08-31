@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
 import { StatusBadge } from '../components/ui/StatusBadge';
@@ -13,15 +13,19 @@ export const HomePage = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { data: videos, isLoading: isVideosLoading } = useVideos();
   const createVideo = useCreateVideo();
+  const navigate = useNavigate();
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!selectedFile || createVideo.isPending) return;
 
     createVideo.mutate(selectedFile, {
-      onSuccess: () => {
+      onSuccess: (video) => {
         setSelectedFile(null);
         if (fileInputRef.current) fileInputRef.current.value = '';
+        // Clip generation now runs in the background - jump straight to the
+        // detail page so the user sees live progress instead of a blank wait.
+        navigate(`/videos/${video.id}`);
       },
     });
   };
@@ -50,8 +54,7 @@ export const HomePage = () => {
 
       {createVideo.isPending && (
         <p className="mt-3 text-sm text-blue-600 dark:text-blue-400">
-          Uploading &amp; processing... this can take several minutes. Please don&apos;t close
-          this page.
+          Uploading&hellip; you&apos;ll be taken to the video&apos;s page to watch progress live.
         </p>
       )}
 
@@ -90,7 +93,7 @@ export const HomePage = () => {
                       </p>
                     )}
                   </div>
-                  <StatusBadge status={video.status} />
+                  <StatusBadge status={video.status} percent={video.progress_percent} />
                 </div>
               </Card>
             </Link>

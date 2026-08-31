@@ -21,6 +21,8 @@ export interface Video {
   status: VideoStatus;
   error_message: string | null;
   language: string | null;
+  progress_stage: string | null;
+  progress_percent: number | null;
   created_at: string;
   clips: Clip[];
 }

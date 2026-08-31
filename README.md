@@ -2,7 +2,7 @@
 
 > **Clone. Define. Build.** Full-stack SaaS in minutes.
 
-This repo currently has `INITIAL.md` filled out for **YouTube Auto Editor** — a local MVP that converts a YouTube URL into 3–5 captioned short-form clips. See `INITIAL.md` for the full spec, and `CLAUDE.md` for this build's stack overrides (no auth, SQLite, no Docker — see "Current Build Override" section there).
+This repo currently has `INITIAL.md` filled out for **Video Auto Editor** — a local MVP that converts an uploaded video file into 3–5 captioned short-form clips, with the pipeline running in the background and live progress in the UI. See `INITIAL.md` for the full spec, `PRPs/video-auto-editor-prp.md` for the implementation blueprint, and `CLAUDE.md` for this build's stack overrides (no auth, SQLite, no Docker — see "Current Build Override" section there).
 
 ---
 
@@ -13,24 +13,19 @@ This repo currently has `INITIAL.md` filled out for **YouTube Auto Editor** — 
 git clone https://github.com/manojkanur/MicroSaaS-Template-Private.git .
 cd my-saas
 
-# 2. Product is already defined in INITIAL.md (YouTube Auto Editor)
-# Edit it if you want to change scope
-
-# 3. Generate blueprint
-/generate-prp INITIAL.md
-
-# 4. Build with parallel agents
-/execute-prp PRPs/youtube-auto-editor-prp.md
+# 2. Product is already defined in INITIAL.md (Video Auto Editor) and already
+# built — see "Run Locally" below. Edit INITIAL.md if you want to change scope,
+# then update PRPs/video-auto-editor-prp.md to match before extending the app.
 ```
 
 ---
 
 ## What You Get (this build)
 
-- FastAPI backend running the video pipeline (`yt-dlp` → transcript → LLM segmentation → `ffmpeg` cut/caption)
-- React frontend: paste-URL form, video list, clip player with hook titles
-- SQLite storage (no Postgres/migrations for this build)
-- No auth, no Docker, no CI — local MVP only
+- FastAPI backend running the video pipeline (upload → local Whisper transcription → heuristic segmentation → `ffmpeg` cut/caption), pipeline runs on a background thread with live status/progress
+- React frontend: upload form, video list with live status, animated progress loader, clip player with hook titles
+- SQLite storage (no Postgres/migrations for this build — additive schema changes are patched in on startup instead)
+- No auth, no Docker, no CI, no LLM call — local MVP only
 
 *(The template also supports the full stack below for production SaaS builds — see `CLAUDE.md`'s override table for what's toggled off here.)*
 
@@ -39,20 +34,16 @@ cd my-saas
 ## How It Works
 
 ```
-INITIAL.md → /generate-prp → PRP blueprint → /execute-prp → Full App
+INITIAL.md defines the product; PRPs/video-auto-editor-prp.md is the
+implementation blueprint for the app as it's actually built (already
+shipped — there's no scaffold-from-scratch step left to run).
 
-Phase 1 (Parallel):
-├─ DATABASE-AGENT  → SQLite models (Video, Clip)
-├─ BACKEND-AGENT   → API + video pipeline service
-├─ FRONTEND-AGENT  → React pages (list + detail/player)
-└─ DEVOPS-AGENT    → skipped this build (no Docker)
+Modules:
+├─ Videos  → upload endpoint, background pipeline, list + detail pages
+└─ Clips   → embedded in the Video response, rendered inline per-clip
 
-Phase 2 (Per Module):
-├─ Backend endpoints (POST/GET /api/videos, GET /api/videos/{id})
-└─ Frontend pages (/  and  /videos/{id})
-
-Phase 3:
-└─ Smoke tests only (80% coverage gate skipped this build)
+Pipeline (per upload, on a background thread):
+transcribing (faster-whisper) → segmenting (heuristic) → cutting_clips (ffmpeg) → done
 ```
 
 ---
@@ -61,7 +52,8 @@ Phase 3:
 
 | File | Purpose |
 |------|---------|
-| `INITIAL.md` | Product spec — currently: YouTube Auto Editor MVP |
+| `INITIAL.md` | Product spec — currently: Video Auto Editor MVP |
+| `PRPs/video-auto-editor-prp.md` | Implementation blueprint matching the shipped app |
 | `CLAUDE.md` | Project rules + this build's stack overrides |
 | `skills/*.md` | Code patterns (5 files) |
 | `agents/*.md` | Agent definitions |
@@ -101,11 +93,11 @@ Phase 3:
 - UI: Chakra UI or Tailwind + Framer Motion
 - Deploy: Docker + GitHub Actions
 
-**This build (YouTube Auto Editor MVP) overrides:**
+**This build (Video Auto Editor MVP) overrides:**
 - Database: SQLite (no migrations)
 - Auth: none
 - Deploy: local only, no Docker
-- Adds: `yt-dlp`, `youtube-transcript-api`, `ffmpeg` for the video pipeline
+- Adds: `faster-whisper`, `ffmpeg` for the video pipeline
 
 ---
 
@@ -118,7 +110,7 @@ my-saas/
 │   │   ├── main.py
 │   │   ├── models/        # Video, Clip
 │   │   ├── routers/       # /api/videos
-│   │   ├── services/      # pipeline: download, transcript, segment, cut, caption
+│   │   ├── services/      # pipeline: transcribe, segment, cut, caption
 │   │   └── auth/          # unused this build
 │   └── tests/
 ├── frontend/
@@ -137,8 +129,7 @@ my-saas/
 
 ```bash
 # Prerequisites (this build)
-brew install ffmpeg          # or apt-get install ffmpeg
-pip install yt-dlp youtube-transcript-api
+brew install ffmpeg          # or apt-get install ffmpeg / choco install ffmpeg
 
 # Backend
 cd backend

@@ -2,6 +2,7 @@
 import logging
 import os
 import shutil
+import threading
 import uuid
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.database import SessionLocal
 from app.dependencies import get_db
 from app.models.video import Video, VideoStatus
 from app.schemas.video import VideoResponse
@@ -37,15 +39,35 @@ def _save_upload(file: UploadFile, output_dir: str, source_path: str) -> None:
         file.file.close()
 
 
+def _run_pipeline_in_background(video_id: int, source_path: str, duration_seconds: float) -> None:
+    """Run the pipeline for `video_id` on its own thread with its own DB session.
+
+    The request's `db` session (from `Depends(get_db)`) closes as soon as the
+    response is sent, so this thread can't reuse it - it opens a fresh
+    `SessionLocal()` and re-fetches the row instead. Run as a plain daemon
+    thread rather than a FastAPI `BackgroundTask`: that keeps a many-minutes
+    Whisper/ffmpeg run fully off Starlette's request threadpool, so it can
+    never compete with (or get starved by) other concurrent requests.
+    """
+    db = SessionLocal()
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if video is None:
+            return
+        pipeline_service.run_pipeline(db, video, source_path, duration_seconds)
+    finally:
+        db.close()
+
+
 @router.post("", response_model=VideoResponse, status_code=201)
 def create_video(file: UploadFile = File(...), db: Session = Depends(get_db)) -> Video:
-    """Upload a video file, then run the full clip-generation pipeline synchronously.
+    """Upload a video file, then kick off clip generation in the background.
 
-    Plain `def`, not `async def`: the pipeline (Whisper, ffmpeg) is all
-    blocking I/O/CPU work. FastAPI runs sync route functions in a worker
-    thread pool, so this one long-running request doesn't freeze the single
-    asyncio event loop for every other concurrent request (list/detail pages,
-    other submissions) the way an `async def` calling blocking code would.
+    Returns as soon as the file is saved and the `Video` row is created
+    (status "pending") - the actual pipeline (Whisper transcription, ffmpeg
+    cutting) runs on a background thread and can take several minutes. The
+    frontend polls `GET /videos/{id}` for live status/progress instead of
+    waiting on this request.
     """
     original_filename = file.filename or "upload"
     ext = Path(original_filename).suffix.lower()
@@ -80,9 +102,12 @@ def create_video(file: UploadFile = File(...), db: Session = Depends(get_db)) ->
     db.commit()
     db.refresh(video)
 
-    pipeline_service.run_pipeline(db, video, source_path)
+    threading.Thread(
+        target=_run_pipeline_in_background,
+        args=(video.id, source_path, duration),
+        daemon=True,
+    ).start()
 
-    db.refresh(video)
     return video
 
 
@@ -97,6 +122,11 @@ def retry_video(video_id: int, db: Session = Depends(get_db)) -> Video:
     if source_path is None:
         raise HTTPException(400, "Original uploaded file is no longer available; please upload again")
 
+    try:
+        duration = pipeline_service.probe_duration_seconds(source_path)
+    except Exception as e:
+        raise HTTPException(400, "Could not read this file as a video.") from e
+
     retry = Video(
         original_filename=original.original_filename,
         storage_key=original.storage_key,
@@ -107,9 +137,12 @@ def retry_video(video_id: int, db: Session = Depends(get_db)) -> Video:
     db.commit()
     db.refresh(retry)
 
-    pipeline_service.run_pipeline(db, retry, source_path)
+    threading.Thread(
+        target=_run_pipeline_in_background,
+        args=(retry.id, source_path, duration),
+        daemon=True,
+    ).start()
 
-    db.refresh(retry)
     return retry
 
 

@@ -2,6 +2,7 @@ import type { VideoStatus } from '../../types';
 
 interface StatusBadgeProps {
   status: VideoStatus;
+  percent?: number | null;
 }
 
 const STATUS_STYLES: Record<VideoStatus, string> = {
@@ -18,12 +19,13 @@ const STATUS_LABELS: Record<VideoStatus, string> = {
   failed: 'Failed',
 };
 
-export const StatusBadge = ({ status }: StatusBadgeProps) => {
+export const StatusBadge = ({ status, percent }: StatusBadgeProps) => {
+  const showPercent = status === 'processing' && typeof percent === 'number';
   return (
     <span
       className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_STYLES[status]}`}
     >
-      {STATUS_LABELS[status]}
+      {showPercent ? `Processing ${percent}%` : STATUS_LABELS[status]}
     </span>
   );
 };

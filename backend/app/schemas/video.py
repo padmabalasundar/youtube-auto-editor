@@ -33,6 +33,8 @@ class VideoResponse(BaseModel):
     status: VideoStatus
     error_message: str | None = None
     language: str | None = None
+    progress_stage: str | None = None
+    progress_percent: int | None = None
     created_at: datetime
     clips: list[ClipResponse] = []
 

@@ -2,7 +2,7 @@
 import enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Enum, String
+from sqlalchemy import Enum, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -39,6 +39,10 @@ class Video(Base, TimestampMixin):
     )
     error_message: Mapped[str | None] = mapped_column(String, nullable=True)
     language: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Live pipeline progress, e.g. stage="transcribing" percent=42 - polled by
+    # the frontend while status is pending/processing to drive a progress bar.
+    progress_stage: Mapped[str | None] = mapped_column(String, nullable=True)
+    progress_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     clips: Mapped[list["Clip"]] = relationship(
         "Clip",

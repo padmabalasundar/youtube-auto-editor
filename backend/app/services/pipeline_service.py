@@ -11,6 +11,7 @@ returns.
 import logging
 import os
 import subprocess
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal, TypedDict
 
@@ -21,6 +22,17 @@ from app.models.clip import Clip, ClipType
 from app.models.video import Video, VideoStatus
 
 logger = logging.getLogger(__name__)
+
+# Progress callback: (stage, percent) -> None. `run_pipeline` calls this
+# (and commits `video.progress_stage`/`progress_percent`) as work advances,
+# so the frontend can poll and show something better than a static spinner.
+ProgressCallback = Callable[[str, int], None]
+
+# Weighting of the overall progress bar across pipeline stages. Transcription
+# dominates wall-clock time on CPU, so it gets the lion's share.
+TRANSCRIBE_PROGRESS_SHARE = 70
+SEGMENT_PROGRESS_AT = 70
+CUTTING_PROGRESS_SHARE = 30
 
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 # Safety cap on a single upload's size, to keep disk/memory usage bounded on
@@ -90,42 +102,82 @@ def find_source_file(output_dir: str, storage_key: str) -> str | None:
     return None
 
 
-def _transcribe_with_whisper(source_path: str) -> tuple[list[TranscriptSegment], str | None]:
+_whisper_model = None
+
+
+def _get_whisper_model():
+    """Load (once) and cache the faster-whisper model across pipeline runs.
+
+    Loading is the slow part of "cold start" (reading + initializing model
+    weights); caching it in a module-level global means only the *first*
+    upload in a server's lifetime pays that cost, instead of every upload.
+    """
+    global _whisper_model
+    if _whisper_model is None:
+        # Lazy import: faster-whisper pulls in ctranslate2, which is heavy
+        # and not guaranteed to be installed. Keep the import local to this call.
+        from faster_whisper import WhisperModel
+
+        # faster-whisper (CTranslate2) is several times faster than
+        # openai-whisper on CPU for the same model size, mainly because of
+        # int8 quantization - worth the accuracy tradeoff here since this is
+        # a CPU-only local MVP, not a quality-max offline batch job.
+        # cpu_threads defaults to a conservative 4 regardless of core count -
+        # pin it to all available cores so a bigger machine actually helps.
+        _whisper_model = WhisperModel(
+            "small", device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4
+        )
+    return _whisper_model
+
+
+def _transcribe_with_whisper(
+    source_path: str,
+    video_duration: float,
+    on_progress: ProgressCallback | None = None,
+) -> tuple[list[TranscriptSegment], str | None]:
     """Transcribe an uploaded video locally with Whisper.
 
     Uploads have no YouTube captions to fall back from, so this always runs -
     unlike the old YouTube-URL flow, there's no "try captions first" step.
     """
-    # Lazy import: Whisper pulls in torch, which is heavy and not guaranteed
-    # to be installed. Keep the import local to this call.
-    import whisper
-
     logger.info(
-        "Transcribing %s locally with Whisper ('small' model, forced "
-        "language=ta). This can take several minutes on CPU with no "
-        "progress logged in between; watch for the tqdm progress bar below.",
+        "Transcribing %s locally with faster-whisper ('small' model, "
+        "int8, forced language=ta). This can take a while on CPU; "
+        "progress is logged and written to the video row as segments land.",
         source_path,
     )
-    model = whisper.load_model("small")
-    # verbose=False: prints a tqdm progress bar (vs. None's total silence,
-    # or True's noisy per-segment dump) so a long CPU run isn't
-    # indistinguishable from a hang in the server logs.
+    model = _get_whisper_model()
+    # beam_size=1 (greedy) and condition_on_previous_text=False both trade a
+    # little accuracy for a large decode-speed win on CPU - condition_on_
+    # previous_text in particular forces fully sequential decoding otherwise.
+    # vad_filter=True skips silent/non-speech stretches instead of decoding
+    # them, which matters a lot for talking-head video with pauses.
     #
     # language="ta": forced rather than auto-detected, per explicit choice -
     # auto-detect can misfire and forcing the known language improves
     # accuracy. This hardcodes transcription to Tamil for every upload;
     # supporting other languages would mean making this a per-submission
     # hint rather than a fixed constant.
-    result = model.transcribe(source_path, verbose=False, language="ta")
-    segments: list[TranscriptSegment] = [
-        {
-            "start": float(seg["start"]),
-            "end": float(seg["end"]),
-            "text": str(seg["text"]),
-        }
-        for seg in result["segments"]
-    ]
-    language: str | None = result.get("language")
+    segment_iter, info = model.transcribe(
+        source_path,
+        language="ta",
+        beam_size=1,
+        condition_on_previous_text=False,
+        vad_filter=True,
+    )
+
+    segments: list[TranscriptSegment] = []
+    last_logged_percent = -1
+    for seg in segment_iter:
+        segments.append({"start": float(seg.start), "end": float(seg.end), "text": str(seg.text)})
+        if on_progress is not None and video_duration > 0:
+            fraction_done = min(1.0, float(seg.end) / video_duration)
+            percent = int(fraction_done * TRANSCRIBE_PROGRESS_SHARE)
+            if percent != last_logged_percent:
+                on_progress("transcribing", percent)
+                last_logged_percent = percent
+
+    language: str | None = info.language
     return segments, language
 
 
@@ -198,65 +250,35 @@ def _validate_clips(clips: list[ClipSegment], video_duration: float | None) -> l
     return valid
 
 
-def _format_srt_timestamp(seconds: float) -> str:
-    """Format seconds as an SRT timestamp: HH:MM:SS,mmm."""
-    if seconds < 0:
-        seconds = 0.0
-    total_ms = round(seconds * 1000)
-    hours, remainder_ms = divmod(total_ms, 3_600_000)
-    minutes, remainder_ms = divmod(remainder_ms, 60_000)
-    secs, millis = divmod(remainder_ms, 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-
-def _write_srt(
-    segments: list[TranscriptSegment],
-    clip_start: float,
-    clip_end: float,
-    srt_path: str,
-) -> None:
-    """Write an SRT file for the transcript segments overlapping [clip_start, clip_end]."""
-    overlapping = [seg for seg in segments if seg["end"] > clip_start and seg["start"] < clip_end]
-    lines: list[str] = []
-    for index, seg in enumerate(overlapping, start=1):
-        rebased_start = max(0.0, seg["start"] - clip_start)
-        rebased_end = max(0.0, min(seg["end"], clip_end) - clip_start)
-        lines.append(str(index))
-        lines.append(f"{_format_srt_timestamp(rebased_start)} --> {_format_srt_timestamp(rebased_end)}")
-        lines.append(seg["text"])
-        lines.append("")
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-
 def _cut_clip(
     output_dir: str,
     source_filename: str,
-    srt_filename: str,
     clip_filename: str,
     start: float,
     end: float,
 ) -> None:
-    """Run ffmpeg to slice, crop-to-vertical, and burn subtitles for one clip.
+    """Run ffmpeg to slice and crop-to-vertical one clip (no burned-in captions).
 
-    `cwd` is set to `output_dir` so `source_filename`/`srt_filename` can stay
-    relative - this avoids the ffmpeg `subtitles=` filter's `:` escaping
-    problem with Windows drive letters (e.g. `G:\\...`) entirely.
+    `cwd` is set to `output_dir` so `source_filename` can stay relative.
     """
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        f"subtitles={srt_filename}"
-    )
+    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
     command = [
         "ffmpeg",
         "-y",
-        "-i",
-        source_filename,
+        # -ss before -i is *input* seeking: ffmpeg jumps near `start` via the
+        # demuxer instead of decoding every frame from 0 up to `start` first.
+        # Since output is being fully re-encoded anyway, ffmpeg still decodes
+        # forward to the exact frame for accuracy - this only skips the
+        # wasted decode of everything before it, which matters a lot for
+        # clips cut from deep into a long source video.
         "-ss",
         str(start),
-        "-to",
-        str(end),
+        "-i",
+        source_filename,
+        # -t (duration), not -to (absolute end): -t is always relative to
+        # where output starts, so it stays correct regardless of -ss placement.
+        "-t",
+        str(max(0.0, end - start)),
         "-vf",
         vf,
         "-c:v",
@@ -278,8 +300,8 @@ def _cut_clip(
 def _cut_all_clips(
     output_dir: str,
     source_filename: str,
-    segments: list[TranscriptSegment],
     valid_clips: list[ClipSegment],
+    on_progress: ProgressCallback | None = None,
 ) -> list[tuple[ClipSegment, str]]:
     """Cut every clip in parallel - each ffmpeg subprocess is independent I/O+CPU work.
 
@@ -288,14 +310,10 @@ def _cut_all_clips(
     """
 
     def _cut_one(index: int, clip_segment: ClipSegment) -> tuple[int, str]:
-        srt_filename = f"clip_{index + 1}.srt"
         clip_filename = f"clip_{index + 1}.mp4"
-        srt_path = os.path.join(output_dir, srt_filename)
-        _write_srt(segments, clip_segment.start, clip_segment.end, srt_path)
         _cut_clip(
             output_dir=output_dir,
             source_filename=source_filename,
-            srt_filename=srt_filename,
             clip_filename=clip_filename,
             start=clip_segment.start,
             end=clip_segment.end,
@@ -306,35 +324,62 @@ def _cut_all_clips(
     max_workers = max(1, min(len(valid_clips), cpu_count // FFMPEG_THREADS_PER_CLIP))
 
     results: list[tuple[ClipSegment, str] | None] = [None] * len(valid_clips)
+    completed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(_cut_one, i, clip) for i, clip in enumerate(valid_clips)]
         for future in as_completed(futures):
             index, clip_filename = future.result()  # re-raises if _cut_one raised
             results[index] = (valid_clips[index], clip_filename)
+            completed += 1
+            if on_progress is not None:
+                fraction_done = completed / len(valid_clips)
+                percent = SEGMENT_PROGRESS_AT + int(fraction_done * CUTTING_PROGRESS_SHARE)
+                on_progress("cutting_clips", percent)
 
     return [pair for pair in results if pair is not None]
 
 
-def run_pipeline(db: Session, video: Video, source_path: str) -> None:
+def run_pipeline(
+    db: Session,
+    video: Video,
+    source_path: str,
+    duration_seconds: float,
+) -> None:
     """Run the full clip-generation pipeline for an already-persisted, already-uploaded Video.
 
     `source_path` is the already-saved upload on disk (the router saves it
-    before creating the DB row). Mutates and commits `video` in place; never
-    raises - any failure along the way is captured onto `video.status` /
+    before creating the DB row). `duration_seconds` is the video's total
+    duration (already probed by the caller) - used only to compute a
+    transcription progress percentage before the real duration is known from
+    the transcript itself. Mutates and commits `video` in place; never raises
+    - any failure along the way is captured onto `video.status` /
     `video.error_message`.
     """
     video.status = VideoStatus.PROCESSING
+    video.progress_stage = "transcribing"
+    video.progress_percent = 0
     db.commit()
+
+    def _report_progress(stage: str, percent: int) -> None:
+        video.progress_stage = stage
+        video.progress_percent = percent
+        db.commit()
+        logger.info(
+            "Video id=%s storage_key=%s progress: %s %d%%", video.id, video.storage_key, stage, percent
+        )
 
     try:
         output_dir = os.path.dirname(source_path)
         source_filename = os.path.basename(source_path)
 
-        segments, language = _transcribe_with_whisper(source_path)
+        segments, language = _transcribe_with_whisper(
+            source_path, duration_seconds, on_progress=_report_progress
+        )
         if not segments:
             raise RuntimeError("No transcript segments were produced")
         video.language = language
 
+        _report_progress("segmenting", SEGMENT_PROGRESS_AT)
         video_duration = segments[-1]["end"]
         proposed_clips = _segment_clips_heuristic(segments, video_duration)
 
@@ -348,7 +393,9 @@ def run_pipeline(db: Session, video: Video, source_path: str) -> None:
             "pain_point_solution": ClipType.PAIN_POINT_SOLUTION,
         }
 
-        cut_results = _cut_all_clips(output_dir, source_filename, segments, valid_clips)
+        cut_results = _cut_all_clips(
+            output_dir, source_filename, valid_clips, on_progress=_report_progress
+        )
         for clip_segment, clip_filename in cut_results:
             relative_file_path = f"{os.path.basename(output_dir)}/{clip_filename}"
             clip = Clip(
@@ -362,6 +409,8 @@ def run_pipeline(db: Session, video: Video, source_path: str) -> None:
             db.add(clip)
 
         video.status = VideoStatus.DONE
+        video.progress_stage = "done"
+        video.progress_percent = 100
         db.commit()
     except Exception as e:
         video.status = VideoStatus.FAILED

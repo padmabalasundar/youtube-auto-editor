@@ -13,6 +13,10 @@ export const useVideos = () => {
       const { data } = await api.get<Video[]>('/videos');
       return data;
     },
+    // Pipeline runs are on the server now instead of blocking the upload
+    // request, so the list needs its own polling to reflect live status/
+    // progress instead of only updating on the next manual refresh.
+    refetchInterval: (query) => (query.state.data?.some(isVideoInFlight) ? 3000 : false),
   });
 };
 
