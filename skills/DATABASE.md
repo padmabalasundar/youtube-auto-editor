@@ -1,6 +1,10 @@
 # Database Skill
 
-> PostgreSQL + SQLAlchemy + Alembic
+> SQLite + SQLAlchemy, no migrations
+
+This build has no Postgres and no Alembic. `app.db` is a single local SQLite
+file; the schema is created on startup and additive column changes are
+patched in automatically. There is no `users` table - single-tenant, no auth.
 
 ---
 
@@ -8,16 +12,14 @@
 
 ```python
 # database.py
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from app.config import settings
-
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+connect_args = {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(settings.DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
 
-def get_db():
+class Base(DeclarativeBase):
+    pass
+
+def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
@@ -27,146 +29,110 @@ def get_db():
 
 ---
 
-## Base Mixins
+## Schema Creation (no migrations)
+
+```python
+def create_tables() -> None:
+    from app.models import Clip, Video  # lazy import, avoids a circular import
+    Base.metadata.create_all(bind=engine)   # creates missing TABLES only
+    _add_missing_columns()                  # patches missing COLUMNS on existing tables
+
+def _add_missing_columns() -> None:
+    """Best-effort ALTER TABLE ADD COLUMN for columns added to a model after
+    an on-disk app.db already exists. Only additive, nullable columns are
+    supported - anything more involved needs a real migration tool."""
+    inspector = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            continue
+        existing = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            column_type = column.type.compile(dialect=engine.dialect)
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column_type}'))
+```
+
+**Rule of thumb:** a new nullable column on `Video`/`Clip` just works on the
+next startup. Anything that isn't additive-and-nullable (renaming a column,
+adding a NOT NULL without a default, dropping a column) needs a manual
+one-off script or a real migration tool - don't rely on `_add_missing_columns`
+for that.
+
+---
+
+## Models
 
 ```python
 # models/base.py
-from sqlalchemy import Column, DateTime, Boolean
-from sqlalchemy.sql import func
-
 class TimestampMixin:
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
+    )
 
-class SoftDeleteMixin:
-    is_deleted = Column(Boolean, default=False)
-    deleted_at = Column(DateTime(timezone=True), nullable=True)
+# models/video.py
+class VideoStatus(str, enum.Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DONE = "done"
+    FAILED = "failed"
+
+class Video(Base, TimestampMixin):
+    __tablename__ = "videos"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    original_filename: Mapped[str] = mapped_column(String, nullable=False)
+    storage_key: Mapped[str] = mapped_column(String, index=True, nullable=False)  # output/{storage_key}/
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[VideoStatus] = mapped_column(Enum(VideoStatus), default=VideoStatus.PENDING, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(String, nullable=True)
+    language: Mapped[str | None] = mapped_column(String, nullable=True)
+    progress_stage: Mapped[str | None] = mapped_column(String, nullable=True)
+    progress_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    clips: Mapped[list["Clip"]] = relationship("Clip", back_populates="video", cascade="all, delete-orphan")
+
+# models/clip.py
+class ClipType(str, enum.Enum):
+    SUMMARY = "summary"
+    MAIN_IDEA = "main_idea"
+    PAIN_POINT_SOLUTION = "pain_point_solution"
+
+class Clip(Base, TimestampMixin):
+    __tablename__ = "clips"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    video_id: Mapped[int] = mapped_column(ForeignKey("videos.id", ondelete="CASCADE"), nullable=False)
+    type: Mapped[ClipType] = mapped_column(Enum(ClipType), nullable=False)
+    hook_title: Mapped[str] = mapped_column(String, nullable=False)
+    start_time: Mapped[float] = mapped_column(Float, nullable=False)
+    end_time: Mapped[float] = mapped_column(Float, nullable=False)
+    file_path: Mapped[str] = mapped_column(String, nullable=False)
+    video: Mapped["Video"] = relationship("Video", back_populates="clips")
 ```
 
 ---
 
-## User Model
+## Query Patterns Actually Used
 
 ```python
-# models/user.py
-from sqlalchemy import Column, Integer, String, Boolean, Enum
-from sqlalchemy.orm import relationship
-import enum
-from app.database import Base
-from app.models.base import TimestampMixin
+# List, most recent first
+db.query(Video).order_by(Video.created_at.desc()).all()
 
-class UserRole(enum.Enum):
-    admin = "admin"
-    user = "user"
+# Fetch one
+db.query(Video).filter(Video.id == video_id).first()
 
-class User(Base, TimestampMixin):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=True)
-    full_name = Column(String(100), nullable=True)
-    is_active = Column(Boolean, default=True)
-    is_verified = Column(Boolean, default=False)
-    role = Column(Enum(UserRole), default=UserRole.user)
-    google_id = Column(String(255), unique=True, nullable=True, index=True)
-    avatar_url = Column(String(500), nullable=True)
-
-    # Relationships
-    posts = relationship("Post", back_populates="author", cascade="all, delete-orphan")
+# Startup sweep: clear zombie "processing" rows left by a killed/reloaded server
+db.query(Video).filter(Video.status == VideoStatus.PROCESSING).all()
 ```
+
+`clips` loads eagerly via the relationship whenever a `Video` is serialized
+through `VideoResponse` - there's no separate paginated clips endpoint, so
+no N+1 concern to manage here.
 
 ---
 
-## One-to-Many Example
+## Best Practices (this build)
 
-```python
-# models/post.py
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, Boolean, Index
-from sqlalchemy.orm import relationship
-from app.database import Base
-from app.models.base import TimestampMixin
-
-class Post(Base, TimestampMixin):
-    __tablename__ = "posts"
-
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(200), nullable=False)
-    slug = Column(String(250), unique=True, index=True)
-    content = Column(Text, nullable=False)
-    is_published = Column(Boolean, default=False)
-    author_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-
-    author = relationship("User", back_populates="posts")
-
-    __table_args__ = (Index('ix_posts_author_published', 'author_id', 'is_published'),)
-```
-
----
-
-## Many-to-Many Example
-
-```python
-# models/tag.py
-from sqlalchemy import Column, Integer, String, Table, ForeignKey
-from sqlalchemy.orm import relationship
-from app.database import Base
-
-post_tags = Table(
-    'post_tags', Base.metadata,
-    Column('post_id', Integer, ForeignKey('posts.id', ondelete='CASCADE'), primary_key=True),
-    Column('tag_id', Integer, ForeignKey('tags.id', ondelete='CASCADE'), primary_key=True)
-)
-
-class Tag(Base):
-    __tablename__ = "tags"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(50), unique=True, nullable=False, index=True)
-    posts = relationship("Post", secondary=post_tags, back_populates="tags")
-```
-
----
-
-## Alembic Commands
-
-```bash
-# Initialize
-alembic init alembic
-
-# Create migration
-alembic revision --autogenerate -m "Create users table"
-
-# Apply migrations
-alembic upgrade head
-
-# Rollback
-alembic downgrade -1
-```
-
----
-
-## Query Patterns
-
-```python
-# Avoid N+1 with eager loading
-from sqlalchemy.orm import joinedload, selectinload
-
-def get_post_with_author(db, post_id: int):
-    return db.query(Post).options(joinedload(Post.author)).filter(Post.id == post_id).first()
-
-# Pagination
-def get_posts_paginated(db, page: int = 1, per_page: int = 10):
-    offset = (page - 1) * per_page
-    return db.query(Post).offset(offset).limit(per_page).all()
-```
-
----
-
-## Best Practices
-
-- Use meaningful table/column names
-- Add indexes on frequently queried columns
-- Use `ondelete="CASCADE"` for foreign keys
-- Create migrations for all schema changes
-- Use mixins for common fields (timestamps)
-- Avoid N+1 with eager loading
+- New model fields: nullable, with a sensible default - `_add_missing_columns` only handles additive changes.
+- No Alembic, no migration files - don't add one unless the schema needs something `_add_missing_columns` can't do.
+- `SessionLocal()` opened directly (not via `Depends(get_db)`) in two places outside a request: `main.py`'s startup sweep and the pipeline's background thread - both are outside FastAPI's dependency-injection scope.
+- Tests use an in-memory SQLite engine (`sqlite:///:memory:` + `StaticPool`) and monkeypatch `SessionLocal` in both `app.main` and `app.routers.videos` so the background thread and startup hook hit the test DB too.

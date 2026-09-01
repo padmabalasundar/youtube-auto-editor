@@ -10,7 +10,6 @@ class Settings(BaseSettings):
 
     APP_NAME: str = "YouTube Auto Editor"
     DATABASE_URL: str = "sqlite:///./app.db"
-    ANTHROPIC_API_KEY: str = ""
     SECRET_KEY: str = "dev-secret-key"
     ALLOWED_ORIGINS: list[str] = ["http://localhost:5173"]
     OUTPUT_DIR: str = "./output"

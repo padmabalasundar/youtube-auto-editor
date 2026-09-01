@@ -13,6 +13,10 @@ export const useVideos = () => {
       const { data } = await api.get<Video[]>('/videos');
       return data;
     },
+    // Pipeline runs are on the server now instead of blocking the upload
+    // request, so the list needs its own polling to reflect live status/
+    // progress instead of only updating on the next manual refresh.
+    refetchInterval: (query) => (query.state.data?.some(isVideoInFlight) ? 3000 : false),
   });
 };
 
@@ -26,10 +30,6 @@ export const useVideo = (id: number) => {
     refetchInterval: (query) => (isVideoInFlight(query.state.data) ? 3000 : false),
   });
 };
-
-interface CreateVideoInput {
-  youtube_url: string;
-}
 
 const extractErrorMessage = (error: unknown): string => {
   if (axios.isAxiosError(error)) {
@@ -45,9 +45,47 @@ export const useCreateVideo = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (input: CreateVideoInput): Promise<Video> => {
+    mutationFn: async (file: File): Promise<Video> => {
+      const formData = new FormData();
+      formData.append('file', file);
       try {
-        const { data } = await api.post<Video>('/videos', input);
+        const { data } = await api.post<Video>('/videos', formData);
+        return data;
+      } catch (error) {
+        throw new Error(extractErrorMessage(error));
+      }
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['videos'] });
+    },
+  });
+};
+
+export const useCreateVideoFromUrl = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (url: string): Promise<Video> => {
+      try {
+        const { data } = await api.post<Video>('/videos/from-url', { url });
+        return data;
+      } catch (error) {
+        throw new Error(extractErrorMessage(error));
+      }
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['videos'] });
+    },
+  });
+};
+
+export const useRetryVideo = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (videoId: number): Promise<Video> => {
+      try {
+        const { data } = await api.post<Video>(`/videos/${videoId}/retry`);
         return data;
       } catch (error) {
         throw new Error(extractErrorMessage(error));

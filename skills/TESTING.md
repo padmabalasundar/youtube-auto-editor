@@ -1,156 +1,97 @@
 # Testing Skill
 
-> pytest (Backend) + Vitest (Frontend)
+> pytest smoke tests only - no coverage gate, no frontend test runner set up
+
+This build tests routing/DB wiring and error paths, not the real pipeline -
+Whisper transcription, `yt-dlp` downloads, and `ffmpeg` cutting are always
+mocked out via `monkeypatch`. There's no `pytest-asyncio` need (routes are
+sync `def`s over a thread-based background pipeline, not `async def`), and
+no Vitest/Testing Library installed on the frontend yet.
 
 ---
 
-## Backend Setup
-
-```bash
-pip install pytest pytest-asyncio pytest-cov httpx
-```
-
----
-
-## Test Fixtures
+## Backend Fixtures
 
 ```python
 # tests/conftest.py
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from app.main import app
-from app.database import Base, get_db
-from app.auth.jwt import create_access_token, hash_password
-from app.models.user import User
+TEST_DB_URL = "sqlite:///:memory:"
+engine = create_engine(TEST_DB_URL, connect_args={"check_same_thread": False}, poolclass=StaticPool)
+TestSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-TEST_DB_URL = "postgresql://test:test@localhost/test_db"
-engine = create_engine(TEST_DB_URL)
-TestSession = sessionmaker(bind=engine)
+@pytest.fixture(autouse=True)
+def _isolated_output_dir(tmp_path, monkeypatch):
+    """Redirect uploads to a per-test temp dir instead of the real output/."""
+    monkeypatch.setattr(settings, "OUTPUT_DIR", str(tmp_path))
 
 @pytest.fixture
 def db():
     Base.metadata.create_all(bind=engine)
     session = TestSession()
-    yield session
-    session.close()
-    Base.metadata.drop_all(bind=engine)
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(bind=engine)
 
 @pytest.fixture
-def client(db):
+def client(db, monkeypatch):
     app.dependency_overrides[get_db] = lambda: db
+    # main.on_startup() and the pipeline's background thread both call
+    # SessionLocal() directly (outside any request) - patch both modules'
+    # reference so they hit the in-memory test DB too, not the real app.db.
+    monkeypatch.setattr(app_main, "SessionLocal", TestSession)
+    monkeypatch.setattr(videos_router, "SessionLocal", TestSession)
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
-
-@pytest.fixture
-def test_user(db):
-    user = User(email="test@example.com", hashed_password=hash_password("password123"), full_name="Test")
-    db.add(user)
-    db.commit()
-    return user
-
-@pytest.fixture
-def auth_headers(test_user):
-    token = create_access_token({"sub": str(test_user.id)})
-    return {"Authorization": f"Bearer {token}"}
 ```
 
 ---
 
-## API Tests
+## API Test Pattern
+
+Mock the pipeline at the `pipeline_service` module boundary, not FastAPI's
+routing - this tests the actual save/probe/limit/thread-start logic in
+`routers/videos.py` while keeping tests near-instant:
 
 ```python
-# tests/test_auth.py
-def test_register(client):
-    response = client.post("/api/v1/auth/register", json={"email": "new@test.com", "password": "password123"})
+# tests/test_videos.py
+def _wait_for_status(client, video_id: int, *, timeout_seconds: float = 2.0) -> dict:
+    """Poll a video until its pipeline (a background thread) leaves pending/processing."""
+    deadline = time.monotonic() + timeout_seconds
+    body = client.get(f"/api/videos/{video_id}").json()
+    while body["status"] in ("pending", "processing") and time.monotonic() < deadline:
+        time.sleep(0.02)
+        body = client.get(f"/api/videos/{video_id}").json()
+    return body
+
+def test_create_video_too_long(client, monkeypatch):
+    monkeypatch.setattr(pipeline_service, "probe_duration_seconds", lambda _path: 5000.0)
+    response = client.post("/api/videos", files={"file": ("clip.mp4", b"fake video bytes", "video/mp4")})
+    assert response.status_code == 400
+
+def test_create_video_success(client, monkeypatch):
+    def fake_run_pipeline(db, video, source_path, duration_seconds) -> None:
+        video.status = VideoStatus.DONE
+        db.commit()
+
+    monkeypatch.setattr(pipeline_service, "probe_duration_seconds", lambda _path: 120.0)
+    monkeypatch.setattr(pipeline_service, "run_pipeline", fake_run_pipeline)
+
+    response = client.post("/api/videos", files={"file": ("clip.mp4", b"fake video bytes", "video/mp4")})
     assert response.status_code == 201
-    assert response.json()["email"] == "new@test.com"
-
-def test_login(client, test_user):
-    response = client.post("/api/v1/auth/login", data={"username": test_user.email, "password": "password123"})
-    assert response.status_code == 200
-    assert "access_token" in response.json()
-
-def test_me_unauthorized(client):
-    assert client.get("/api/v1/auth/me").status_code == 401
-
-def test_me_authorized(client, auth_headers):
-    response = client.get("/api/v1/auth/me", headers=auth_headers)
-    assert response.status_code == 200
+    assert response.json()["status"] == "pending"   # returns before the (fake) pipeline finishes
+    assert _wait_for_status(client, response.json()["id"])["status"] == "done"
 ```
 
----
-
-## Service Tests
+The YouTube-URL path mocks one level deeper - `probe_youtube_metadata` and
+`download_youtube_video` - so tests never hit the network:
 
 ```python
-# tests/test_user_service.py
-import pytest
-from app.services import user_service
-from app.exceptions import NotFoundError
-
-def test_get_user(db, test_user):
-    user = user_service.get_user(db, test_user.id)
-    assert user.email == test_user.email
-
-def test_get_user_not_found(db):
-    with pytest.raises(NotFoundError):
-        user_service.get_user(db, 99999)
-```
-
----
-
-## Frontend Setup
-
-```bash
-npm install -D vitest @testing-library/react @testing-library/jest-dom @testing-library/user-event msw
-```
-
----
-
-## Component Tests
-
-```typescript
-// src/__tests__/LoginForm.test.tsx
-import { render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
-import { LoginForm } from '../components/forms/LoginForm';
-
-test('renders login form', () => {
-  render(<LoginForm />);
-  expect(screen.getByLabelText(/email/i)).toBeInTheDocument();
-  expect(screen.getByLabelText(/password/i)).toBeInTheDocument();
-});
-
-test('submits form', async () => {
-  const user = userEvent.setup();
-  render(<LoginForm />);
-  await user.type(screen.getByLabelText(/email/i), 'test@example.com');
-  await user.type(screen.getByLabelText(/password/i), 'password123');
-  await user.click(screen.getByRole('button', { name: /sign in/i }));
-});
-```
-
----
-
-## Hook Tests
-
-```typescript
-// src/__tests__/usePosts.test.tsx
-import { renderHook, waitFor } from '@testing-library/react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { usePosts } from '../hooks/usePosts';
-
-const wrapper = ({ children }) => (
-  <QueryClientProvider client={new QueryClient()}>{children}</QueryClientProvider>
-);
-
-test('fetches posts', async () => {
-  const { result } = renderHook(() => usePosts(), { wrapper });
-  await waitFor(() => expect(result.current.isSuccess).toBe(true));
-});
+def test_create_video_from_url_too_long(client, monkeypatch):
+    monkeypatch.setattr(pipeline_service, "probe_youtube_metadata", lambda _url: (5000.0, "A long video"))
+    response = client.post("/api/videos/from-url", json={"url": "https://youtu.be/abc123"})
+    assert response.status_code == 400
 ```
 
 ---
@@ -159,22 +100,22 @@ test('fetches posts', async () => {
 
 ```bash
 # Backend
-pytest                    # Run all
-pytest -v                 # Verbose
-pytest --cov=app         # With coverage
-pytest --cov-fail-under=80  # Require 80%
+cd backend
+pytest -v
+ruff check backend/
 
-# Frontend
-npm test                  # Run tests
-npm run test:coverage    # With coverage
+# Frontend (no test runner configured - these are the checks that exist)
+cd frontend
+npm run lint         # oxlint
+npx tsc -b --noEmit  # type-check
+npm run build        # also catches type errors, verifies the production bundle
 ```
 
 ---
 
-## Best Practices
+## Best Practices (this build)
 
-- Use fixtures for test data
-- Test success AND error cases
-- Mock external dependencies
-- Target 80%+ coverage
-- Clean up between tests
+- Smoke tests only - happy path plus the real error paths (bad extension, too long, not found, missing source file on retry). No 80% coverage gate.
+- Mock at the `pipeline_service` function boundary (`probe_duration_seconds`, `run_pipeline`, `probe_youtube_metadata`, `download_youtube_video`), not deeper - keeps tests fast and decoupled from Whisper/ffmpeg/yt-dlp actually being installed correctly in CI.
+- `_isolated_output_dir` is `autouse=True` - every test gets a throwaway `OUTPUT_DIR`, so nothing writes into the real `output/` during a test run.
+- No frontend component/hook tests exist yet. If you add real UI test coverage, install `vitest` + `@testing-library/react` first - don't assume they're already wired up.

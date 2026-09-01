@@ -1,35 +1,75 @@
-"""Core video-processing pipeline: download, transcribe, segment, cut clips.
+"""Core video-processing pipeline: fetch source, transcribe, segment, cut clips.
 
-`extract_video_metadata` is a cheap pre-check the router calls before it ever
-creates a `Video` row (so an invalid URL / too-long video never touches the
-database). `run_pipeline` is the heavy, synchronous pipeline that mutates and
-commits a single already-persisted `Video` row; it never raises - any failure
-is captured onto the row itself (`status=failed`, `error_message=...`) so the
-caller can simply re-read the row after the call returns.
+A source video can arrive two ways - a direct file upload, or a YouTube URL
+downloaded via `download_youtube_video` - but once a `source.<ext>` file
+exists on disk, both paths run through the exact same pipeline below.
+`probe_duration_seconds` / `probe_youtube_metadata` are cheap pre-checks the
+router calls before any `Video` DB row is created (so a too-long video never
+touches the database). `run_pipeline` is the heavy, synchronous pipeline that
+mutates and commits a single already-persisted `Video` row; it never raises -
+any failure is captured onto the row itself (`status=failed`,
+`error_message=...`) so the caller can simply re-read the row after the call
+returns.
 """
 import logging
 import os
 import subprocess
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal, TypedDict
+from urllib.parse import urlparse
 
-import anthropic
-import yt_dlp
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.config import settings
-from app.exceptions import ValidationError
 from app.models.clip import Clip, ClipType
 from app.models.video import Video, VideoStatus
 
 logger = logging.getLogger(__name__)
 
+# Hostnames accepted by the "paste a YouTube URL" input - deliberately
+# restrictive rather than handing yt-dlp's generic extractor (which supports
+# thousands of sites) an arbitrary user-supplied URL to fetch.
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+
+# Progress callback: (stage, percent) -> None. `run_pipeline` calls this
+# (and commits `video.progress_stage`/`progress_percent`) as work advances,
+# so the frontend can poll and show something better than a static spinner.
+ProgressCallback = Callable[[str, int], None]
+
+# Weighting of the overall progress bar across pipeline stages. Transcription
+# dominates wall-clock time on CPU, so it gets the lion's share.
+TRANSCRIBE_PROGRESS_SHARE = 70
+SEGMENT_PROGRESS_AT = 70
+CUTTING_PROGRESS_SHARE = 30
+
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+# Safety cap on a single upload's size, to keep disk/memory usage bounded on
+# what's meant to be a lightweight local MVP.
+MAX_UPLOAD_BYTES = 1500 * 1024 * 1024
+
 MIN_CLIP_SECONDS = 45.0
 MAX_CLIP_SECONDS = 75.0
-# How far outside [MIN_CLIP_SECONDS, MAX_CLIP_SECONDS] a model-proposed clip
+# How far outside [MIN_CLIP_SECONDS, MAX_CLIP_SECONDS] a proposed clip
 # duration is still tolerated (rather than skipped outright) as defensive
-# slack against imprecise model output.
+# slack against imprecise segmentation.
 CLIP_DURATION_SLACK_SECONDS = 15.0
+
+TARGET_CLIP_SECONDS = 60.0
+MAX_CLIPS = 5
+CLIP_TYPE_CYCLE: list[Literal["summary", "main_idea", "pain_point_solution"]] = [
+    "summary",
+    "main_idea",
+    "pain_point_solution",
+    "pain_point_solution",
+    "pain_point_solution",
+]
+
+# Each ffmpeg encode is itself multi-threaded; running several full-width
+# encodes at once oversubscribes CPU cores. Capping per-process threads and
+# bounding how many run concurrently keeps total thread usage close to the
+# core count instead of thrashing.
+FFMPEG_THREADS_PER_CLIP = 2
 
 
 class TranscriptSegment(TypedDict):
@@ -40,16 +80,8 @@ class TranscriptSegment(TypedDict):
     text: str
 
 
-class VideoMetadata(TypedDict):
-    """Metadata extracted from a YouTube URL before any DB row is created."""
-
-    youtube_id: str
-    title: str | None
-    duration: float | None
-
-
 class ClipSegment(BaseModel):
-    """One clip segment proposed by the segmentation model."""
+    """One proposed clip: a time window plus its title and slot type."""
 
     type: Literal["summary", "main_idea", "pain_point_solution"]
     start: float
@@ -57,123 +89,205 @@ class ClipSegment(BaseModel):
     hook_title: str
 
 
-class SegmentationResult(BaseModel):
-    """The full set of clip segments proposed by the segmentation model."""
+def probe_duration_seconds(path: str) -> float:
+    """Read a media file's duration via ffprobe. Raises on an unreadable/invalid file."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return float(result.stdout.strip())
 
-    clips: list[ClipSegment]
+
+def is_youtube_url(url: str) -> bool:
+    """Whether `url`'s host is a recognized YouTube domain."""
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return host.lower() in YOUTUBE_HOSTS
 
 
-def extract_video_metadata(youtube_url: str) -> VideoMetadata:
-    """Fetch id/title/duration for a YouTube URL without downloading it.
+def probe_youtube_metadata(url: str) -> tuple[float, str]:
+    """Fetch a YouTube video's (duration_seconds, title) without downloading it.
 
-    Raises whatever `yt_dlp` raises (e.g. `yt_dlp.utils.DownloadError`) for an
-    invalid/unreachable URL - the caller is expected to translate that into a
-    400. Raises `ValidationError` directly if the video's duration is unknown
-    or exceeds `settings.MAX_VIDEO_DURATION_SECONDS`.
+    Cheap pre-check the router calls before creating a `Video` row, so a
+    too-long video is rejected before ever being downloaded. Raises whatever
+    yt-dlp raises (e.g. for an invalid/unreachable URL) - the caller is
+    expected to translate that into a 400.
     """
-    ydl_opts: dict[str, bool | str] = {"quiet": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=False)
+    # Lazy import: yt-dlp is only needed for the YouTube-URL input path.
+    from yt_dlp import YoutubeDL
+
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
 
     duration = info.get("duration")
-    if duration is None or duration > settings.MAX_VIDEO_DURATION_SECONDS:
-        raise ValidationError("Video exceeds the 30-minute limit")
-
-    return VideoMetadata(
-        youtube_id=info["id"],
-        title=info.get("title"),
-        duration=duration,
-    )
+    if duration is None:
+        raise RuntimeError("Could not determine this video's duration")
+    return float(duration), info.get("title") or "YouTube video"
 
 
-def _download_source_video(youtube_url: str, output_dir: str) -> str:
-    """Download the source video into `output_dir` as `source.mp4`."""
+def download_youtube_video(url: str, output_dir: str) -> str:
+    """Download a YouTube video into `output_dir` as `source.mp4`. Returns the saved path."""
+    from yt_dlp import YoutubeDL
+
     source_path = os.path.join(output_dir, "source.mp4")
-    ydl_opts: dict[str, str | bool] = {
+    ydl_opts = {
         "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
         "format": (
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=1080][ext=mp4]/best"
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
         ),
         "merge_output_format": "mp4",
         "outtmpl": source_path,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([youtube_url])
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
     return source_path
 
 
-def _fetch_transcript(youtube_id: str, source_path: str) -> tuple[list[TranscriptSegment], str | None]:
-    """Get timestamped transcript segments and a detected language.
+def find_source_file(output_dir: str, storage_key: str) -> str | None:
+    """Locate an already-uploaded source file for `storage_key`, if it still exists."""
+    folder = os.path.join(output_dir, storage_key)
+    if not os.path.isdir(folder):
+        return None
+    for name in os.listdir(folder):
+        if name.startswith("source."):
+            return os.path.join(folder, name)
+    return None
 
-    Tries the YouTube captions API first; falls back to local Whisper
-    transcription of the downloaded source video if no captions exist.
+
+_whisper_model = None
+
+
+def _get_whisper_model():
+    """Load (once) and cache the faster-whisper model across pipeline runs.
+
+    Loading is the slow part of "cold start" (reading + initializing model
+    weights); caching it in a module-level global means only the *first*
+    upload in a server's lifetime pays that cost, instead of every upload.
     """
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
+    global _whisper_model
+    if _whisper_model is None:
+        # Lazy import: faster-whisper pulls in ctranslate2, which is heavy
+        # and not guaranteed to be installed. Keep the import local to this call.
+        from faster_whisper import WhisperModel
 
-        fetched = YouTubeTranscriptApi().fetch(youtube_id)
-        segments: list[TranscriptSegment] = [
-            {
-                "start": float(snippet.start),
-                "end": float(snippet.start) + float(snippet.duration),
-                "text": snippet.text,
-            }
-            for snippet in fetched
-        ]
-        language: str | None = getattr(fetched, "language_code", None)
-        if not segments:
-            raise ValueError("Empty transcript returned")
-        return segments, language
-    except Exception as api_error:  # noqa: BLE001 - any captions failure falls back to Whisper
-        logger.warning(
-            "youtube_transcript_api failed for %s, falling back to Whisper: %s",
-            youtube_id,
-            api_error,
+        # faster-whisper (CTranslate2) is several times faster than
+        # openai-whisper on CPU for the same model size, mainly because of
+        # int8 quantization - worth the accuracy tradeoff here since this is
+        # a CPU-only local MVP, not a quality-max offline batch job.
+        # cpu_threads defaults to a conservative 4 regardless of core count -
+        # pin it to all available cores so a bigger machine actually helps.
+        _whisper_model = WhisperModel(
+            "small", device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4
         )
-
-    # Lazy import: Whisper pulls in torch, which is heavy and not guaranteed
-    # to be installed. Keep the import local to this fallback path only.
-    import whisper
-
-    model = whisper.load_model("small")
-    result = model.transcribe(source_path)
-    whisper_segments: list[TranscriptSegment] = [
-        {
-            "start": float(seg["start"]),
-            "end": float(seg["end"]),
-            "text": str(seg["text"]),
-        }
-        for seg in result["segments"]
-    ]
-    whisper_language: str | None = result.get("language")
-    return whisper_segments, whisper_language
+    return _whisper_model
 
 
-def _build_timestamped_transcript(segments: list[TranscriptSegment]) -> str:
-    """Render segments as `[start-end] text` lines for the LLM prompt."""
-    lines = [f"[{seg['start']:.2f}-{seg['end']:.2f}] {seg['text']}" for seg in segments]
-    return "\n".join(lines)
+def _transcribe_with_whisper(
+    source_path: str,
+    video_duration: float,
+    on_progress: ProgressCallback | None = None,
+) -> tuple[list[TranscriptSegment], str | None]:
+    """Transcribe an uploaded video locally with Whisper.
 
-
-def _segment_clips(timestamped_transcript: str) -> SegmentationResult:
-    """Ask Claude to pick clip segments from the timestamped transcript."""
-    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-    response = client.messages.parse(
-        model="claude-opus-5",
-        max_tokens=4096,
-        system=(
-            "You select short-form clips from a YouTube transcript. Given a timestamped "
-            "transcript, pick 3 to 5 segments: one 'summary', one 'main_idea', and up to "
-            "3 'pain_point_solution' segments. Each segment must be 45 to 75 seconds long "
-            "(end - start), use timestamps that exist in the transcript, and get a short, "
-            "curiosity-inducing hook_title in the SAME language as the transcript - do not translate."
-        ),
-        messages=[{"role": "user", "content": timestamped_transcript}],
-        output_format=SegmentationResult,
+    Uploads have no YouTube captions to fall back from, so this always runs -
+    unlike the old YouTube-URL flow, there's no "try captions first" step.
+    """
+    logger.info(
+        "Transcribing %s locally with faster-whisper ('small' model, "
+        "int8, forced language=ta). This can take a while on CPU; "
+        "progress is logged and written to the video row as segments land.",
+        source_path,
     )
-    result: SegmentationResult = response.parsed_output
-    return result
+    model = _get_whisper_model()
+    # beam_size=1 (greedy) and condition_on_previous_text=False both trade a
+    # little accuracy for a large decode-speed win on CPU - condition_on_
+    # previous_text in particular forces fully sequential decoding otherwise.
+    # vad_filter=True skips silent/non-speech stretches instead of decoding
+    # them, which matters a lot for talking-head video with pauses.
+    #
+    # language=None: auto-detect from the first 30s of audio rather than
+    # forcing a single language, so uploads in any language transcribe
+    # correctly instead of only Tamil.
+    segment_iter, info = model.transcribe(
+        source_path,
+        language=None,
+        beam_size=1,
+        condition_on_previous_text=False,
+        vad_filter=True,
+    )
+
+    segments: list[TranscriptSegment] = []
+    last_logged_percent = -1
+    for seg in segment_iter:
+        segments.append({"start": float(seg.start), "end": float(seg.end), "text": str(seg.text)})
+        if on_progress is not None and video_duration > 0:
+            fraction_done = min(1.0, float(seg.end) / video_duration)
+            percent = int(fraction_done * TRANSCRIBE_PROGRESS_SHARE)
+            if percent != last_logged_percent:
+                on_progress("transcribing", percent)
+                last_logged_percent = percent
+
+    language: str | None = info.language
+    return segments, language
+
+
+def _derive_title(segments: list[TranscriptSegment], start: float, end: float) -> str:
+    """Best-effort clip title: the first sentence-ish chunk of its transcript text."""
+    text = " ".join(
+        seg["text"].strip() for seg in segments if seg["end"] > start and seg["start"] < end
+    ).strip()
+    if not text:
+        return "Clip"
+    for delimiter in (". ", "! ", "? ", "\n"):
+        idx = text.find(delimiter)
+        if 10 < idx < 80:
+            return text[: idx + 1].strip()
+    return f"{text[:77]}..." if len(text) > 80 else text
+
+
+def _segment_clips_heuristic(segments: list[TranscriptSegment], video_duration: float) -> list[ClipSegment]:
+    """Pick clip windows without an LLM: evenly-spaced ~60s windows across the video.
+
+    No Anthropic (or any) API call - titles come from each window's own
+    transcript text rather than being AI-generated. Noticeably lower quality
+    than an LLM pick, but free and has no external dependency.
+    """
+    if video_duration <= 0:
+        raise RuntimeError("Video has no measurable duration to segment.")
+
+    clip_length = TARGET_CLIP_SECONDS
+    num_clips = min(MAX_CLIPS, int(video_duration // clip_length))
+    if num_clips < 1:
+        # Video shorter than one full-length clip: use a single clip
+        # spanning it (validated/possibly dropped downstream if too short).
+        num_clips = 1
+        clip_length = video_duration
+
+    spacing = video_duration / num_clips
+    clips: list[ClipSegment] = []
+    for i in range(num_clips):
+        start = i * spacing
+        end = min(start + clip_length, video_duration)
+        if end - start < 1.0:
+            continue
+        clips.append(
+            ClipSegment(
+                type=CLIP_TYPE_CYCLE[i % len(CLIP_TYPE_CYCLE)],
+                start=start,
+                end=end,
+                # No transcript (e.g. a silent/no-speech source): fall back to
+                # a numbered title instead of every clip being titled "Clip".
+                hook_title=_derive_title(segments, start, end) if segments else f"Clip {i + 1}",
+            )
+        )
+    return clips
 
 
 def _validate_clips(clips: list[ClipSegment], video_duration: float | None) -> list[ClipSegment]:
@@ -195,69 +309,46 @@ def _validate_clips(clips: list[ClipSegment], video_duration: float | None) -> l
     return valid
 
 
-def _format_srt_timestamp(seconds: float) -> str:
-    """Format seconds as an SRT timestamp: HH:MM:SS,mmm."""
-    if seconds < 0:
-        seconds = 0.0
-    total_ms = round(seconds * 1000)
-    hours, remainder_ms = divmod(total_ms, 3_600_000)
-    minutes, remainder_ms = divmod(remainder_ms, 60_000)
-    secs, millis = divmod(remainder_ms, 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-
-def _write_srt(
-    segments: list[TranscriptSegment],
-    clip_start: float,
-    clip_end: float,
-    srt_path: str,
-) -> None:
-    """Write an SRT file for the transcript segments overlapping [clip_start, clip_end]."""
-    overlapping = [seg for seg in segments if seg["end"] > clip_start and seg["start"] < clip_end]
-    lines: list[str] = []
-    for index, seg in enumerate(overlapping, start=1):
-        rebased_start = max(0.0, seg["start"] - clip_start)
-        rebased_end = max(0.0, min(seg["end"], clip_end) - clip_start)
-        lines.append(str(index))
-        lines.append(f"{_format_srt_timestamp(rebased_start)} --> {_format_srt_timestamp(rebased_end)}")
-        lines.append(seg["text"])
-        lines.append("")
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-
 def _cut_clip(
     output_dir: str,
     source_filename: str,
-    srt_filename: str,
     clip_filename: str,
     start: float,
     end: float,
 ) -> None:
-    """Run ffmpeg to slice, crop-to-vertical, and burn subtitles for one clip.
+    """Run ffmpeg to slice and crop-to-vertical one clip (no burned-in captions).
 
-    `cwd` is set to `output_dir` so `source_filename`/`srt_filename` can stay
-    relative - this avoids the ffmpeg `subtitles=` filter's `:` escaping
-    problem with Windows drive letters (e.g. `G:\\...`) entirely.
+    `cwd` is set to `output_dir` so `source_filename` can stay relative.
     """
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        f"subtitles={srt_filename}"
-    )
+    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
     command = [
         "ffmpeg",
         "-y",
-        "-i",
-        source_filename,
+        # -ss before -i is *input* seeking: ffmpeg jumps near `start` via the
+        # demuxer instead of decoding every frame from 0 up to `start` first.
+        # Since output is being fully re-encoded anyway, ffmpeg still decodes
+        # forward to the exact frame for accuracy - this only skips the
+        # wasted decode of everything before it, which matters a lot for
+        # clips cut from deep into a long source video.
         "-ss",
         str(start),
-        "-to",
-        str(end),
+        "-i",
+        source_filename,
+        # -t (duration), not -to (absolute end): -t is always relative to
+        # where output starts, so it stays correct regardless of -ss placement.
+        "-t",
+        str(max(0.0, end - start)),
         "-vf",
         vf,
         "-c:v",
         "libx264",
+        # veryfast: much quicker than libx264's "medium" default at a modest
+        # bitrate-efficiency cost - the right tradeoff for a local MVP where
+        # wall-clock time matters more than file size.
+        "-preset",
+        "veryfast",
+        "-threads",
+        str(FFMPEG_THREADS_PER_CLIP),
         "-c:a",
         "aac",
         clip_filename,
@@ -265,34 +356,98 @@ def _cut_clip(
     subprocess.run(command, check=True, capture_output=True, cwd=output_dir)
 
 
-def run_pipeline(db: Session, video: Video) -> None:
-    """Run the full clip-generation pipeline for an already-persisted Video.
+def _cut_all_clips(
+    output_dir: str,
+    source_filename: str,
+    valid_clips: list[ClipSegment],
+    on_progress: ProgressCallback | None = None,
+) -> list[tuple[ClipSegment, str]]:
+    """Cut every clip in parallel - each ffmpeg subprocess is independent I/O+CPU work.
 
-    Mutates and commits `video` in place; never raises - any failure along
-    the way is captured onto `video.status` / `video.error_message`.
+    Returns (clip_segment, clip_filename) pairs in the original clip order.
+    Raises (propagating the first error) if any single clip fails to cut.
+    """
+
+    def _cut_one(index: int, clip_segment: ClipSegment) -> tuple[int, str]:
+        clip_filename = f"clip_{index + 1}.mp4"
+        _cut_clip(
+            output_dir=output_dir,
+            source_filename=source_filename,
+            clip_filename=clip_filename,
+            start=clip_segment.start,
+            end=clip_segment.end,
+        )
+        return index, clip_filename
+
+    cpu_count = os.cpu_count() or 4
+    max_workers = max(1, min(len(valid_clips), cpu_count // FFMPEG_THREADS_PER_CLIP))
+
+    results: list[tuple[ClipSegment, str] | None] = [None] * len(valid_clips)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_cut_one, i, clip) for i, clip in enumerate(valid_clips)]
+        for future in as_completed(futures):
+            index, clip_filename = future.result()  # re-raises if _cut_one raised
+            results[index] = (valid_clips[index], clip_filename)
+            completed += 1
+            if on_progress is not None:
+                fraction_done = completed / len(valid_clips)
+                percent = SEGMENT_PROGRESS_AT + int(fraction_done * CUTTING_PROGRESS_SHARE)
+                on_progress("cutting_clips", percent)
+
+    return [pair for pair in results if pair is not None]
+
+
+def run_pipeline(
+    db: Session,
+    video: Video,
+    source_path: str,
+    duration_seconds: float,
+) -> None:
+    """Run the full clip-generation pipeline for an already-persisted, already-uploaded Video.
+
+    `source_path` is the already-saved upload on disk (the router saves it
+    before creating the DB row). `duration_seconds` is the video's total
+    duration (already probed by the caller) - used only to compute a
+    transcription progress percentage before the real duration is known from
+    the transcript itself. Mutates and commits `video` in place; never raises
+    - any failure along the way is captured onto `video.status` /
+    `video.error_message`.
     """
     video.status = VideoStatus.PROCESSING
+    video.progress_stage = "transcribing"
+    video.progress_percent = 0
     db.commit()
 
+    def _report_progress(stage: str, percent: int) -> None:
+        video.progress_stage = stage
+        video.progress_percent = percent
+        db.commit()
+        logger.info(
+            "Video id=%s storage_key=%s progress: %s %d%%", video.id, video.storage_key, stage, percent
+        )
+
     try:
-        output_dir = os.path.join(settings.OUTPUT_DIR, video.youtube_id)
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = os.path.dirname(source_path)
+        source_filename = os.path.basename(source_path)
 
-        source_path = _download_source_video(video.youtube_url, output_dir)
-
-        segments, language = _fetch_transcript(video.youtube_id, source_path)
-        if not segments:
-            raise RuntimeError("No transcript segments were produced")
+        segments, language = _transcribe_with_whisper(
+            source_path, duration_seconds, on_progress=_report_progress
+        )
         video.language = language
 
-        timestamped_transcript = _build_timestamped_transcript(segments)
+        _report_progress("segmenting", SEGMENT_PROGRESS_AT)
+        # Always use the pre-probed source duration, not the last transcript
+        # segment's end time: Whisper's VAD can miss trailing speech (music,
+        # silence, a stretch with no dialogue), which would otherwise make
+        # the segmenter think the video ends early and skip real content
+        # after the last detected segment.
+        video_duration = duration_seconds
+        proposed_clips = _segment_clips_heuristic(segments, video_duration)
 
-        segmentation_result = _segment_clips(timestamped_transcript)
-
-        video_duration = segments[-1]["end"] if segments else None
-        valid_clips = _validate_clips(segmentation_result.clips, video_duration)
+        valid_clips = _validate_clips(proposed_clips, video_duration)
         if len(valid_clips) < 1:
-            raise RuntimeError("No valid clips were produced by the segmentation model")
+            raise RuntimeError("No valid clips were produced by the segmentation step")
 
         clip_type_map = {
             "summary": ClipType.SUMMARY,
@@ -300,22 +455,11 @@ def run_pipeline(db: Session, video: Video) -> None:
             "pain_point_solution": ClipType.PAIN_POINT_SOLUTION,
         }
 
-        for index, clip_segment in enumerate(valid_clips, start=1):
-            srt_filename = f"clip_{index}.srt"
-            clip_filename = f"clip_{index}.mp4"
-            srt_path = os.path.join(output_dir, srt_filename)
-
-            _write_srt(segments, clip_segment.start, clip_segment.end, srt_path)
-            _cut_clip(
-                output_dir=output_dir,
-                source_filename="source.mp4",
-                srt_filename=srt_filename,
-                clip_filename=clip_filename,
-                start=clip_segment.start,
-                end=clip_segment.end,
-            )
-
-            relative_file_path = f"{video.youtube_id}/{clip_filename}"
+        cut_results = _cut_all_clips(
+            output_dir, source_filename, valid_clips, on_progress=_report_progress
+        )
+        for clip_segment, clip_filename in cut_results:
+            relative_file_path = f"{os.path.basename(output_dir)}/{clip_filename}"
             clip = Clip(
                 video_id=video.id,
                 type=clip_type_map[clip_segment.type],
@@ -327,10 +471,12 @@ def run_pipeline(db: Session, video: Video) -> None:
             db.add(clip)
 
         video.status = VideoStatus.DONE
+        video.progress_stage = "done"
+        video.progress_percent = 100
         db.commit()
     except Exception as e:
         video.status = VideoStatus.FAILED
         video.error_message = str(e)
         db.commit()
-        logger.exception("Pipeline failed for video id=%s youtube_id=%s", video.id, video.youtube_id)
+        logger.exception("Pipeline failed for video id=%s storage_key=%s", video.id, video.storage_key)
         return

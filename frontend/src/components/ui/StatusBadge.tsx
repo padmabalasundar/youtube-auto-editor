@@ -2,13 +2,14 @@ import type { VideoStatus } from '../../types';
 
 interface StatusBadgeProps {
   status: VideoStatus;
+  percent?: number | null;
 }
 
 const STATUS_STYLES: Record<VideoStatus, string> = {
-  pending: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
-  processing: 'bg-blue-100 text-blue-700 animate-pulse dark:bg-blue-900/40 dark:text-blue-300',
-  done: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
-  failed: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+  pending: 'bg-white/10 text-gray-300',
+  processing: 'bg-nflix-red/20 text-red-400 animate-pulse',
+  done: 'bg-green-500/20 text-green-400',
+  failed: 'bg-red-500/20 text-red-400',
 };
 
 const STATUS_LABELS: Record<VideoStatus, string> = {
@@ -18,12 +19,13 @@ const STATUS_LABELS: Record<VideoStatus, string> = {
   failed: 'Failed',
 };
 
-export const StatusBadge = ({ status }: StatusBadgeProps) => {
+export const StatusBadge = ({ status, percent }: StatusBadgeProps) => {
+  const showPercent = status === 'processing' && typeof percent === 'number';
   return (
     <span
       className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_STYLES[status]}`}
     >
-      {STATUS_LABELS[status]}
+      {showPercent ? `Processing ${percent}%` : STATUS_LABELS[status]}
     </span>
   );
 };

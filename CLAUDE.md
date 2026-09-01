@@ -4,7 +4,7 @@
 
 ---
 
-## ⚠️ Current Build Override (YouTube Auto Editor MVP)
+## ⚠️ Current Build Override (Video Auto Editor MVP)
 
 This project's default stack (below) is for the general template. The **current build** (see `INITIAL.md`) is a 60-minute local MVP with no user accounts, so these defaults are overridden until stated otherwise:
 
@@ -26,7 +26,7 @@ All other rules below (type hints, async endpoints, forbidden patterns, env vars
 - **Database:** PostgreSQL + SQLAlchemy *(this build: SQLite + SQLAlchemy — see override above)*
 - **Auth:** JWT + Google OAuth *(this build: none — see override above)*
 - **UI:** Chakra UI or Tailwind + Framer Motion
-- **Video pipeline** *(this build only)*: `yt-dlp`, `youtube-transcript-api`, `ffmpeg`
+- **Video pipeline** *(this build only)*: `faster-whisper`, `ffmpeg`
 
 ---
 
@@ -100,11 +100,11 @@ const fetchUser = async (id: number): Promise<User> => { ... };
 
 | Task | Skill |
 |------|-------|
-| API + Auth | `skills/BACKEND.md` *(auth section unused this build)* |
+| API + video pipeline | `skills/BACKEND.md` |
 | React + UI | `skills/FRONTEND.md` |
 | Models | `skills/DATABASE.md` |
 | Tests | `skills/TESTING.md` |
-| Docker | `skills/DEPLOYMENT.md` *(unused this build)* |
+| Deployment (systemd + Nginx, no Docker) | `skills/DEPLOYMENT.md` |
 
 ---
 
@@ -132,10 +132,9 @@ npm run lint && npm run type-check
 ## Environment Variables
 
 ```env
-# This build (YouTube Auto Editor MVP)
+# This build (Video Auto Editor MVP)
 DATABASE_URL=sqlite:///./app.db
 SECRET_KEY=your-secret-key
-LLM_API_KEY=xxx
 VITE_API_URL=http://localhost:8000
 
 # Template defaults (not used this build)
