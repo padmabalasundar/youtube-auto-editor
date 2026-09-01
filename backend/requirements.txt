@@ -13,11 +13,16 @@ python-dotenv>=1.0.0
 python-multipart>=0.0.9
 
 # --- Transcription ---
-# Whisper transcribes every upload locally (no YouTube captions to fall back
-# from). faster-whisper (CTranslate2 + int8 quantization) runs the same
-# model sizes several times faster than openai-whisper on CPU, and pulls in
-# ctranslate2 instead of torch - lighter, not just faster.
+# Whisper transcribes every video locally (no YouTube captions API - both the
+# upload and YouTube-URL input paths transcribe the same way). faster-whisper
+# (CTranslate2 + int8 quantization) runs the same model sizes several times
+# faster than openai-whisper on CPU, and pulls in ctranslate2 instead of
+# torch - lighter, not just faster.
 faster-whisper>=1.0.0
+
+# --- YouTube URL input ---
+# Downloads the source video for the "paste a YouTube URL" input path.
+yt-dlp>=2024.12.6
 
 # ffmpeg and ffprobe are required system binaries (not pip packages) - must
 # be on PATH. Used for clip cutting/captioning and duration probing.

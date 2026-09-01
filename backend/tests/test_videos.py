@@ -72,6 +72,48 @@ def test_create_video_success(client, monkeypatch):
     assert body["clips"] == []
 
 
+def test_create_video_from_url_rejects_non_youtube(client):
+    response = client.post("/api/videos/from-url", json={"url": "https://example.com/video.mp4"})
+    assert response.status_code == 400
+
+
+def test_create_video_from_url_too_long(client, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_service, "probe_youtube_metadata", lambda _url: (5000.0, "A long video")
+    )
+
+    response = client.post("/api/videos/from-url", json={"url": "https://youtu.be/abc123"})
+    assert response.status_code == 400
+
+
+def test_create_video_from_url_success(client, monkeypatch, tmp_path):
+    def fake_run_pipeline(db, video: Video, source_path: str, duration_seconds: float) -> None:
+        video.status = VideoStatus.DONE
+        db.commit()
+
+    def fake_download(_url: str, output_dir: str) -> str:
+        source_path = f"{output_dir}/source.mp4"
+        with open(source_path, "wb") as f:
+            f.write(b"fake video bytes")
+        return source_path
+
+    monkeypatch.setattr(
+        pipeline_service, "probe_youtube_metadata", lambda _url: (120.0, "My Video")
+    )
+    monkeypatch.setattr(pipeline_service, "download_youtube_video", fake_download)
+    monkeypatch.setattr(pipeline_service, "probe_duration_seconds", lambda _path: 120.0)
+    monkeypatch.setattr(pipeline_service, "run_pipeline", fake_run_pipeline)
+
+    response = client.post("/api/videos/from-url", json={"url": "https://youtu.be/abc123"})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["title"] == "My Video"
+    assert body["status"] == "pending"
+
+    body = _wait_for_status(client, body["id"])
+    assert body["status"] == "done"
+
+
 def test_get_video_not_found(client):
     response = client.get("/api/videos/9999")
     assert response.status_code == 404

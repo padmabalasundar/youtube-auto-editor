@@ -4,18 +4,27 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
 import { StatusBadge } from '../components/ui/StatusBadge';
-import { useCreateVideo, useVideos } from '../hooks/useVideos';
+import { useCreateVideo, useCreateVideoFromUrl, useVideos } from '../hooks/useVideos';
 
 const ACCEPTED_EXTENSIONS = '.mp4,.mov,.mkv,.webm,.avi';
+// Must match the backend's MAX_VIDEO_DURATION_SECONDS (backend/app/config.py).
+const MAX_VIDEO_MINUTES = 30;
+
+type InputMode = 'upload' | 'url';
 
 export const HomePage = () => {
+  const [inputMode, setInputMode] = useState<InputMode>('upload');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [youtubeUrl, setYoutubeUrl] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { data: videos, isLoading: isVideosLoading } = useVideos();
   const createVideo = useCreateVideo();
+  const createVideoFromUrl = useCreateVideoFromUrl();
   const navigate = useNavigate();
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+  const activeMutation = inputMode === 'upload' ? createVideo : createVideoFromUrl;
+
+  const handleUploadSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!selectedFile || createVideo.isPending) return;
 
@@ -28,6 +37,18 @@ export const HomePage = () => {
     });
   };
 
+  const handleUrlSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!youtubeUrl.trim() || createVideoFromUrl.isPending) return;
+
+    createVideoFromUrl.mutate(youtubeUrl.trim(), {
+      onSuccess: (video) => {
+        setYoutubeUrl('');
+        navigate(`/videos/${video.id}`);
+      },
+    });
+  };
+
   return (
     <div>
       <section className="-mx-4 -mt-4 rounded-b-lg bg-gradient-to-b from-black/60 via-black/40 to-nflix-black bg-nflix-red/10 px-4 py-16 text-center sm:-mx-8 sm:px-8">
@@ -35,36 +56,90 @@ export const HomePage = () => {
           Turn long videos into scroll-stopping clips
         </h1>
         <p className="mx-auto mt-3 max-w-xl text-gray-300">
-          Upload once. Get shareable, captioned shorts &mdash; automatically.
+          Upload a file or paste a YouTube link. Get shareable, captioned shorts &mdash; automatically.
+        </p>
+        <p className="mx-auto mt-1 max-w-xl text-xs text-gray-400">
+          Works with videos up to {MAX_VIDEO_MINUTES} minutes long.
         </p>
 
-        <form
-          onSubmit={handleSubmit}
-          className="mx-auto mt-8 flex max-w-xl flex-col gap-3 sm:flex-row"
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            required
-            accept={ACCEPTED_EXTENSIONS}
-            onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
-            disabled={createVideo.isPending}
-            className="flex-1 rounded border border-white/20 bg-black/40 px-4 py-3 text-sm text-white file:mr-3 file:rounded file:border-0 file:bg-white/15 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white disabled:cursor-not-allowed disabled:opacity-50"
-          />
-          <Button type="submit" disabled={!selectedFile || createVideo.isPending} className="px-8 py-3 text-base">
-            {createVideo.isPending ? 'Processing...' : 'Generate Clips'}
-          </Button>
-        </form>
+        <div className="mx-auto mt-6 flex max-w-xl justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => setInputMode('upload')}
+            className={`rounded px-4 py-1.5 text-sm font-semibold transition-colors ${
+              inputMode === 'upload' ? 'bg-nflix-red text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'
+            }`}
+          >
+            Upload Video
+          </button>
+          <button
+            type="button"
+            onClick={() => setInputMode('url')}
+            className={`rounded px-4 py-1.5 text-sm font-semibold transition-colors ${
+              inputMode === 'url' ? 'bg-nflix-red text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'
+            }`}
+          >
+            YouTube URL
+          </button>
+        </div>
 
-        {createVideo.isPending && (
-          <p className="mt-3 text-sm text-red-400">
-            Uploading&hellip; you&apos;ll be taken to the video&apos;s page to watch progress live.
+        {inputMode === 'upload' ? (
+          <form
+            onSubmit={handleUploadSubmit}
+            className="mx-auto mt-4 flex max-w-xl flex-col gap-3 sm:flex-row"
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              required
+              accept={ACCEPTED_EXTENSIONS}
+              onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
+              disabled={createVideo.isPending}
+              className="flex-1 rounded border border-white/20 bg-black/40 px-4 py-3 text-sm text-white file:mr-3 file:rounded file:border-0 file:bg-white/15 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white disabled:cursor-not-allowed disabled:opacity-50"
+            />
+            <Button type="submit" disabled={!selectedFile || createVideo.isPending} className="px-8 py-3 text-base">
+              {createVideo.isPending ? 'Processing...' : 'Generate Clips'}
+            </Button>
+          </form>
+        ) : (
+          <form
+            onSubmit={handleUrlSubmit}
+            className="mx-auto mt-4 flex max-w-xl flex-col gap-3 sm:flex-row"
+          >
+            <input
+              type="url"
+              required
+              placeholder="https://www.youtube.com/watch?v=..."
+              value={youtubeUrl}
+              onChange={(event) => setYoutubeUrl(event.target.value)}
+              disabled={createVideoFromUrl.isPending}
+              className="flex-1 rounded border border-white/20 bg-black/40 px-4 py-3 text-sm text-white placeholder:text-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
+            />
+            <Button
+              type="submit"
+              disabled={!youtubeUrl.trim() || createVideoFromUrl.isPending}
+              className="px-8 py-3 text-base"
+            >
+              {createVideoFromUrl.isPending ? 'Processing...' : 'Generate Clips'}
+            </Button>
+          </form>
+        )}
+        {inputMode === 'url' && (
+          <p className="mx-auto mt-2 max-w-xl text-xs text-gray-400">
+            YouTube videos longer than {MAX_VIDEO_MINUTES} minutes are rejected before downloading.
           </p>
         )}
 
-        {createVideo.isError && (
+        {activeMutation.isPending && (
+          <p className="mt-3 text-sm text-red-400">
+            {inputMode === 'upload' ? 'Uploading' : 'Fetching'}&hellip; you&apos;ll be taken to the
+            video&apos;s page to watch progress live.
+          </p>
+        )}
+
+        {activeMutation.isError && (
           <div role="alert" className="mx-auto mt-3 max-w-xl rounded bg-red-500/10 px-4 py-3 text-sm text-red-400">
-            {createVideo.error.message}
+            {activeMutation.error.message}
           </div>
         )}
       </section>

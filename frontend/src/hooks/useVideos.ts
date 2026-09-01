@@ -61,6 +61,24 @@ export const useCreateVideo = () => {
   });
 };
 
+export const useCreateVideoFromUrl = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (url: string): Promise<Video> => {
+      try {
+        const { data } = await api.post<Video>('/videos/from-url', { url });
+        return data;
+      } catch (error) {
+        throw new Error(extractErrorMessage(error));
+      }
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['videos'] });
+    },
+  });
+};
+
 export const useRetryVideo = () => {
   const queryClient = useQueryClient();
 

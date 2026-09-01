@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -19,6 +20,12 @@ from app.services import pipeline_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/videos", tags=["videos"])
+
+
+class VideoUrlRequest(BaseModel):
+    """Body for POST /videos/from-url."""
+
+    url: str
 
 
 def _save_upload(file: UploadFile, output_dir: str, source_path: str) -> None:
@@ -59,6 +66,39 @@ def _run_pipeline_in_background(video_id: int, source_path: str, duration_second
         db.close()
 
 
+def _create_video_and_start_pipeline(
+    db: Session,
+    *,
+    original_filename: str,
+    storage_key: str,
+    title: str | None,
+    source_path: str,
+    duration_seconds: float,
+) -> Video:
+    """Persist a new `Video` row (status "pending") and kick off its pipeline thread.
+
+    Shared by both input paths (file upload and YouTube URL) once each has
+    produced a `source.<ext>` file on disk and knows its duration.
+    """
+    video = Video(
+        original_filename=original_filename,
+        storage_key=storage_key,
+        title=title,
+        status=VideoStatus.PENDING,
+    )
+    db.add(video)
+    db.commit()
+    db.refresh(video)
+
+    threading.Thread(
+        target=_run_pipeline_in_background,
+        args=(video.id, source_path, duration_seconds),
+        daemon=True,
+    ).start()
+
+    return video
+
+
 @router.post("", response_model=VideoResponse, status_code=201)
 def create_video(file: UploadFile = File(...), db: Session = Depends(get_db)) -> Video:
     """Upload a video file, then kick off clip generation in the background.
@@ -90,25 +130,65 @@ def create_video(file: UploadFile = File(...), db: Session = Depends(get_db)) ->
 
     if duration > settings.MAX_VIDEO_DURATION_SECONDS:
         shutil.rmtree(output_dir, ignore_errors=True)
-        raise HTTPException(400, "Video exceeds the 30-minute limit")
+        limit_minutes = settings.MAX_VIDEO_DURATION_SECONDS // 60
+        raise HTTPException(400, f"Video exceeds the {limit_minutes}-minute limit")
 
-    video = Video(
+    return _create_video_and_start_pipeline(
+        db,
         original_filename=original_filename,
         storage_key=storage_key,
         title=Path(original_filename).stem,
-        status=VideoStatus.PENDING,
+        source_path=source_path,
+        duration_seconds=duration,
     )
-    db.add(video)
-    db.commit()
-    db.refresh(video)
 
-    threading.Thread(
-        target=_run_pipeline_in_background,
-        args=(video.id, source_path, duration),
-        daemon=True,
-    ).start()
 
-    return video
+@router.post("/from-url", response_model=VideoResponse, status_code=201)
+def create_video_from_url(payload: VideoUrlRequest, db: Session = Depends(get_db)) -> Video:
+    """Download a YouTube video by URL, then kick off clip generation exactly like an upload.
+
+    Duration is checked against the same limit as uploads before anything is
+    downloaded, using yt-dlp's metadata-only lookup - a too-long video is
+    rejected without ever being fetched.
+    """
+    if not pipeline_service.is_youtube_url(payload.url):
+        raise HTTPException(400, "Only YouTube URLs are supported")
+
+    try:
+        duration, title = pipeline_service.probe_youtube_metadata(payload.url)
+    except Exception as e:
+        raise HTTPException(400, "Could not read this YouTube URL.") from e
+
+    if duration > settings.MAX_VIDEO_DURATION_SECONDS:
+        limit_minutes = settings.MAX_VIDEO_DURATION_SECONDS // 60
+        raise HTTPException(400, f"Video exceeds the {limit_minutes}-minute limit")
+
+    storage_key = uuid.uuid4().hex[:12]
+    output_dir = os.path.join(settings.OUTPUT_DIR, storage_key)
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        source_path = pipeline_service.download_youtube_video(payload.url, output_dir)
+    except Exception as e:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise HTTPException(400, "Could not download this YouTube video.") from e
+
+    # Re-probe the actual downloaded file rather than trusting yt-dlp's
+    # reported metadata duration, matching the upload path's source of truth.
+    try:
+        duration = pipeline_service.probe_duration_seconds(source_path)
+    except Exception as e:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise HTTPException(400, "Downloaded file could not be read as a video.") from e
+
+    return _create_video_and_start_pipeline(
+        db,
+        original_filename=f"{title}.mp4",
+        storage_key=storage_key,
+        title=title,
+        source_path=source_path,
+        duration_seconds=duration,
+    )
 
 
 @router.post("/{video_id}/retry", response_model=VideoResponse, status_code=201)
@@ -127,23 +207,14 @@ def retry_video(video_id: int, db: Session = Depends(get_db)) -> Video:
     except Exception as e:
         raise HTTPException(400, "Could not read this file as a video.") from e
 
-    retry = Video(
+    return _create_video_and_start_pipeline(
+        db,
         original_filename=original.original_filename,
         storage_key=original.storage_key,
         title=original.title,
-        status=VideoStatus.PENDING,
+        source_path=source_path,
+        duration_seconds=duration,
     )
-    db.add(retry)
-    db.commit()
-    db.refresh(retry)
-
-    threading.Thread(
-        target=_run_pipeline_in_background,
-        args=(retry.id, source_path, duration),
-        daemon=True,
-    ).start()
-
-    return retry
 
 
 @router.get("", response_model=list[VideoResponse])

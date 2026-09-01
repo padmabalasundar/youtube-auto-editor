@@ -1,6 +1,9 @@
 # Frontend Skill
 
-> React + TypeScript + Modern UI + API Integration
+> React + TypeScript + Vite + Tailwind + React Query
+
+No Chakra UI, no Framer Motion, no auth context - this build has no login.
+UI is a fixed dark, Netflix-inspired theme (no light/dark toggle).
 
 ---
 
@@ -10,256 +13,14 @@
 frontend/
 ├── src/
 │   ├── components/
-│   │   ├── ui/          # GlassCard, GradientButton, AnimatedInput
-│   │   ├── layout/      # PageWrapper, MeshBackground
-│   │   └── forms/       # LoginForm, RegisterForm
-│   ├── pages/           # Route pages
-│   ├── hooks/           # Custom hooks
-│   ├── services/        # API client
-│   ├── context/         # AuthContext
-│   ├── types/           # TypeScript interfaces
-│   ├── lib/             # Utils (cn function)
+│   │   ├── ui/          # Button, Card, StatusBadge, ProgressLoader
+│   │   └── layout/       # Layout (header + page shell)
+│   ├── pages/            # HomePage (upload + list), VideoDetailPage
+│   ├── hooks/             # useVideos.ts - all React Query hooks
+│   ├── services/          # api.ts - the one axios instance
+│   ├── types/             # Video, Clip, VideoStatus, ClipType
 │   └── App.tsx
 └── package.json
-```
-
----
-
-## Setup
-
-```bash
-npm create vite@latest frontend -- --template react-ts
-cd frontend
-npm install axios react-router-dom @tanstack/react-query framer-motion
-npm install @chakra-ui/react @emotion/react @emotion/styled  # OR
-npm install tailwindcss clsx tailwind-merge                  # Tailwind
-```
-
----
-
-## API Client
-
-```typescript
-// services/api.ts
-import axios from 'axios';
-
-const api = axios.create({
-  baseURL: `${import.meta.env.VITE_API_URL}/api/v1`,
-});
-
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('access_token');
-  if (token) config.headers.Authorization = `Bearer ${token}`;
-  return config;
-});
-
-api.interceptors.response.use(
-  (res) => res,
-  async (error) => {
-    if (error.response?.status === 401 && !error.config._retry) {
-      error.config._retry = true;
-      const refresh = localStorage.getItem('refresh_token');
-      const { data } = await axios.post(`${import.meta.env.VITE_API_URL}/api/v1/auth/refresh`, { refresh_token: refresh });
-      localStorage.setItem('access_token', data.access_token);
-      localStorage.setItem('refresh_token', data.refresh_token);
-      return api(error.config);
-    }
-    return Promise.reject(error);
-  }
-);
-
-export default api;
-```
-
----
-
-## Auth Context
-
-```typescript
-// context/AuthContext.tsx
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import api from '../services/api';
-
-interface User { id: number; email: string; full_name: string | null; }
-interface AuthContextType {
-  user: User | null;
-  isLoading: boolean;
-  login: (email: string, password: string) => Promise<void>;
-  logout: () => void;
-}
-
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
-
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-
-  useEffect(() => {
-    const token = localStorage.getItem('access_token');
-    if (token) {
-      api.get('/auth/me').then(r => setUser(r.data)).catch(() => {}).finally(() => setIsLoading(false));
-    } else {
-      setIsLoading(false);
-    }
-  }, []);
-
-  const login = async (email: string, password: string) => {
-    const form = new FormData();
-    form.append('username', email);
-    form.append('password', password);
-    const { data } = await api.post('/auth/login', form);
-    localStorage.setItem('access_token', data.access_token);
-    localStorage.setItem('refresh_token', data.refresh_token);
-    const user = await api.get('/auth/me');
-    setUser(user.data);
-  };
-
-  const logout = () => {
-    localStorage.clear();
-    setUser(null);
-  };
-
-  return <AuthContext.Provider value={{ user, isLoading, login, logout }}>{children}</AuthContext.Provider>;
-}
-
-export const useAuth = () => useContext(AuthContext)!;
-```
-
----
-
-## Modern UI Components
-
-### GlassCard
-```typescript
-// components/ui/GlassCard.tsx
-import { motion } from 'framer-motion';
-import { ReactNode } from 'react';
-
-export function GlassCard({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      whileHover={{ scale: 1.02, y: -5 }}
-      className={`p-6 rounded-2xl bg-white/10 backdrop-blur-lg border border-white/20 shadow-xl ${className}`}
-    >
-      {children}
-    </motion.div>
-  );
-}
-```
-
-### GradientButton
-```typescript
-// components/ui/GradientButton.tsx
-import { motion } from 'framer-motion';
-import { ButtonHTMLAttributes } from 'react';
-
-export function GradientButton({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
-  return (
-    <motion.button
-      whileHover={{ scale: 1.02, y: -2 }}
-      whileTap={{ scale: 0.98 }}
-      className="px-6 py-3 rounded-full font-semibold text-white bg-gradient-to-r from-purple-500 to-pink-500 hover:shadow-lg"
-      {...props}
-    >
-      {children}
-    </motion.button>
-  );
-}
-```
-
-### PageWrapper
-```typescript
-// components/layout/PageWrapper.tsx
-import { motion } from 'framer-motion';
-import { ReactNode } from 'react';
-
-export function PageWrapper({ children }: { children: ReactNode }) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, x: -20 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: 20 }}
-      transition={{ duration: 0.3 }}
-      className="min-h-screen"
-    >
-      {children}
-    </motion.div>
-  );
-}
-```
-
-### AnimatedList
-```typescript
-// components/ui/AnimatedList.tsx
-import { motion } from 'framer-motion';
-import { ReactNode } from 'react';
-
-export function AnimatedList({ children }: { children: ReactNode[] }) {
-  return (
-    <motion.div initial="hidden" animate="visible" variants={{ visible: { transition: { staggerChildren: 0.1 } } }}>
-      {children.map((child, i) => (
-        <motion.div key={i} variants={{ hidden: { opacity: 0, y: 20 }, visible: { opacity: 1, y: 0 } }}>
-          {child}
-        </motion.div>
-      ))}
-    </motion.div>
-  );
-}
-```
-
-### MeshBackground
-```typescript
-// components/layout/MeshBackground.tsx
-export function MeshBackground() {
-  return (
-    <div className="fixed inset-0 -z-10 overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-br from-purple-50 via-white to-pink-50" />
-      <div className="absolute top-0 left-1/4 w-96 h-96 bg-purple-200 rounded-full blur-3xl opacity-30 animate-pulse" />
-      <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-pink-200 rounded-full blur-3xl opacity-30 animate-pulse" />
-    </div>
-  );
-}
-```
-
-### AnimatedInput
-```typescript
-// components/ui/AnimatedInput.tsx
-import { motion } from 'framer-motion';
-import { InputHTMLAttributes, forwardRef } from 'react';
-
-interface Props extends InputHTMLAttributes<HTMLInputElement> { label?: string; error?: string; }
-
-export const AnimatedInput = forwardRef<HTMLInputElement, Props>(({ label, error, ...props }, ref) => (
-  <div>
-    {label && <label className="block text-sm font-medium mb-1">{label}</label>}
-    <motion.input
-      ref={ref}
-      whileFocus={{ scale: 1.01 }}
-      className={`w-full px-4 py-3 rounded-xl border-2 ${error ? 'border-red-500' : 'border-gray-200'} focus:border-purple-500 outline-none`}
-      {...props}
-    />
-    {error && <p className="text-red-500 text-sm mt-1">{error}</p>}
-  </div>
-));
-```
-
----
-
-## Protected Route
-
-```typescript
-// components/ProtectedRoute.tsx
-import { Navigate } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
-
-export function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { user, isLoading } = useAuth();
-  if (isLoading) return <div>Loading...</div>;
-  if (!user) return <Navigate to="/login" />;
-  return <>{children}</>;
-}
 ```
 
 ---
@@ -268,24 +29,19 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
 ```typescript
 // App.tsx
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { AuthProvider } from './context/AuthContext';
-import { ProtectedRoute } from './components/ProtectedRoute';
-
 const queryClient = new QueryClient();
 
-export default function App() {
+function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <BrowserRouter>
+      <BrowserRouter>
+        <Layout>
           <Routes>
-            <Route path="/login" element={<LoginPage />} />
-            <Route path="/dashboard" element={<ProtectedRoute><DashboardPage /></ProtectedRoute>} />
+            <Route path="/" element={<HomePage />} />
+            <Route path="/videos/:id" element={<VideoDetailPage />} />
           </Routes>
-        </BrowserRouter>
-      </AuthProvider>
+        </Layout>
+      </BrowserRouter>
     </QueryClientProvider>
   );
 }
@@ -293,37 +49,93 @@ export default function App() {
 
 ---
 
-## React Query Hooks
+## API Client
 
 ```typescript
-// hooks/useResource.ts
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import api from '../services/api';
-
-export function useItems(page = 1) {
-  return useQuery({ queryKey: ['items', page], queryFn: () => api.get(`/items?page=${page}`).then(r => r.data) });
-}
-
-export function useCreateItem() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (data: any) => api.post('/items', data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['items'] }),
-  });
-}
+// services/api.ts
+export const api = axios.create({
+  baseURL: `${import.meta.env.VITE_API_URL ?? 'http://localhost:8000'}/api`,
+});
 ```
+
+No auth interceptor, no token refresh - there's nothing to authenticate.
+`VITE_API_URL` is baked in at build time; the frontend appends `/api` (via
+`api.ts`) and `/output` (directly, for clip video `src` URLs) itself.
 
 ---
 
-## UI Rules
+## React Query Hooks Pattern
+
+```typescript
+// hooks/useVideos.ts
+const isVideoInFlight = (video: Video | undefined): boolean =>
+  video?.status === 'pending' || video?.status === 'processing';
+
+export const useVideos = () =>
+  useQuery({
+    queryKey: ['videos'],
+    queryFn: async (): Promise<Video[]> => (await api.get<Video[]>('/videos')).data,
+    // Pipeline runs server-side in the background - poll while anything is in flight.
+    refetchInterval: (query) => (query.state.data?.some(isVideoInFlight) ? 3000 : false),
+  });
+
+export const useCreateVideo = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (file: File): Promise<Video> => {
+      const formData = new FormData();
+      formData.append('file', file);
+      const { data } = await api.post<Video>('/videos', formData);
+      return data;
+    },
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['videos'] }),
+  });
+};
+```
+
+Errors are normalized once via a shared `extractErrorMessage(error)` helper
+that pulls FastAPI's `{ detail: string }` out of an Axios error, so every
+mutation's `.error.message` is already a user-displayable string.
+
+---
+
+## UI Components (Netflix-dark theme)
+
+```typescript
+// components/ui/Button.tsx
+const variantStyles = {
+  primary: 'bg-nflix-red text-white hover:bg-nflix-red-dark',
+  secondary: 'bg-white/15 text-white hover:bg-white/25',
+};
+```
+
+```typescript
+// components/ui/Card.tsx - hover-scale "poster tile"
+className={`rounded-md bg-nflix-surface p-4 transition-transform duration-200
+  hover:scale-[1.03] hover:shadow-xl hover:shadow-black/50 ${className}`}
+```
+
+Color tokens (`nflix-red`, `nflix-black`, `nflix-surface`) are defined once
+via Tailwind v4's `@theme` block in `index.css` - there's no
+`tailwind.config.js` in this build (Tailwind v4 + `@tailwindcss/vite`).
+
+The whole app is a single fixed dark palette - **no `dark:` variant classes**
+anywhere, since Netflix has no light mode and it keeps the shipped CSS
+smaller. If you're tempted to add a light theme, that's a deliberate design
+change, not a bug fix.
+
+---
+
+## UI Rules (this build)
 
 | Element | Use This Component |
-|---------|-------------------|
-| All pages | `PageWrapper` |
-| Cards | `GlassCard` |
-| Primary buttons | `GradientButton` |
-| Lists | `AnimatedList` |
-| Form inputs | `AnimatedInput` |
-| Auth pages | `MeshBackground` |
+|---------|--------------------|
+| Any card/tile | `Card` (hover-scale) |
+| Primary actions | `Button variant="primary"` (red) |
+| Secondary actions | `Button variant="secondary"` (translucent white) |
+| Video status | `StatusBadge` |
+| In-progress pipeline state | `ProgressLoader` (per-stage progress bar) |
 
-**Every interactive element must have hover/tap animations.**
+No `PageWrapper`/`GlassCard`/`GradientButton`/`MeshBackground` - those were
+template components for a different, marketing-heavy multi-tenant SaaS and
+don't exist in this codebase.

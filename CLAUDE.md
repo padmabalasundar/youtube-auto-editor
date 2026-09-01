@@ -100,11 +100,11 @@ const fetchUser = async (id: number): Promise<User> => { ... };
 
 | Task | Skill |
 |------|-------|
-| API + Auth | `skills/BACKEND.md` *(auth section unused this build)* |
+| API + video pipeline | `skills/BACKEND.md` |
 | React + UI | `skills/FRONTEND.md` |
 | Models | `skills/DATABASE.md` |
 | Tests | `skills/TESTING.md` |
-| Docker | `skills/DEPLOYMENT.md` *(unused this build)* |
+| Deployment (systemd + Nginx, no Docker) | `skills/DEPLOYMENT.md` |
 
 ---
 

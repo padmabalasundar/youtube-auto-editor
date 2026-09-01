@@ -1,10 +1,13 @@
-"""Core video-processing pipeline: transcribe, segment, cut clips.
+"""Core video-processing pipeline: fetch source, transcribe, segment, cut clips.
 
-`probe_duration_seconds` is a cheap pre-check the router calls right after
-saving an upload to disk, before any `Video` DB row is created (so a too-long
-upload never touches the database). `run_pipeline` is the heavy, synchronous
-pipeline that mutates and commits a single already-persisted `Video` row; it
-never raises - any failure is captured onto the row itself (`status=failed`,
+A source video can arrive two ways - a direct file upload, or a YouTube URL
+downloaded via `download_youtube_video` - but once a `source.<ext>` file
+exists on disk, both paths run through the exact same pipeline below.
+`probe_duration_seconds` / `probe_youtube_metadata` are cheap pre-checks the
+router calls before any `Video` DB row is created (so a too-long video never
+touches the database). `run_pipeline` is the heavy, synchronous pipeline that
+mutates and commits a single already-persisted `Video` row; it never raises -
+any failure is captured onto the row itself (`status=failed`,
 `error_message=...`) so the caller can simply re-read the row after the call
 returns.
 """
@@ -14,6 +17,7 @@ import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal, TypedDict
+from urllib.parse import urlparse
 
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -22,6 +26,11 @@ from app.models.clip import Clip, ClipType
 from app.models.video import Video, VideoStatus
 
 logger = logging.getLogger(__name__)
+
+# Hostnames accepted by the "paste a YouTube URL" input - deliberately
+# restrictive rather than handing yt-dlp's generic extractor (which supports
+# thousands of sites) an arbitrary user-supplied URL to fetch.
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 
 # Progress callback: (stage, percent) -> None. `run_pipeline` calls this
 # (and commits `video.progress_stage`/`progress_percent`) as work advances,
@@ -91,6 +100,56 @@ def probe_duration_seconds(path: str) -> float:
     return float(result.stdout.strip())
 
 
+def is_youtube_url(url: str) -> bool:
+    """Whether `url`'s host is a recognized YouTube domain."""
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return host.lower() in YOUTUBE_HOSTS
+
+
+def probe_youtube_metadata(url: str) -> tuple[float, str]:
+    """Fetch a YouTube video's (duration_seconds, title) without downloading it.
+
+    Cheap pre-check the router calls before creating a `Video` row, so a
+    too-long video is rejected before ever being downloaded. Raises whatever
+    yt-dlp raises (e.g. for an invalid/unreachable URL) - the caller is
+    expected to translate that into a 400.
+    """
+    # Lazy import: yt-dlp is only needed for the YouTube-URL input path.
+    from yt_dlp import YoutubeDL
+
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    duration = info.get("duration")
+    if duration is None:
+        raise RuntimeError("Could not determine this video's duration")
+    return float(duration), info.get("title") or "YouTube video"
+
+
+def download_youtube_video(url: str, output_dir: str) -> str:
+    """Download a YouTube video into `output_dir` as `source.mp4`. Returns the saved path."""
+    from yt_dlp import YoutubeDL
+
+    source_path = os.path.join(output_dir, "source.mp4")
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "format": (
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+        ),
+        "merge_output_format": "mp4",
+        "outtmpl": source_path,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    return source_path
+
+
 def find_source_file(output_dir: str, storage_key: str) -> str | None:
     """Locate an already-uploaded source file for `storage_key`, if it still exists."""
     folder = os.path.join(output_dir, storage_key)
@@ -153,14 +212,12 @@ def _transcribe_with_whisper(
     # vad_filter=True skips silent/non-speech stretches instead of decoding
     # them, which matters a lot for talking-head video with pauses.
     #
-    # language="ta": forced rather than auto-detected, per explicit choice -
-    # auto-detect can misfire and forcing the known language improves
-    # accuracy. This hardcodes transcription to Tamil for every upload;
-    # supporting other languages would mean making this a per-submission
-    # hint rather than a fixed constant.
+    # language=None: auto-detect from the first 30s of audio rather than
+    # forcing a single language, so uploads in any language transcribe
+    # correctly instead of only Tamil.
     segment_iter, info = model.transcribe(
         source_path,
-        language="ta",
+        language=None,
         beam_size=1,
         condition_on_previous_text=False,
         vad_filter=True,
