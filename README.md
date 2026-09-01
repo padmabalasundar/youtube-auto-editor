@@ -1,4 +1,4 @@
-# Video Auto Editor
+# YouTube Auto Editor Agent
 
 > Upload a long video, get back short, captioned, vertical clips — automatically.
 
