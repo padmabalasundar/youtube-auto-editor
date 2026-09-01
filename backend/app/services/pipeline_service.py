@@ -202,8 +202,8 @@ def _segment_clips_heuristic(segments: list[TranscriptSegment], video_duration: 
     transcript text rather than being AI-generated. Noticeably lower quality
     than an LLM pick, but free and has no external dependency.
     """
-    if not segments or video_duration <= 0:
-        raise RuntimeError("No transcript content available to segment.")
+    if video_duration <= 0:
+        raise RuntimeError("Video has no measurable duration to segment.")
 
     clip_length = TARGET_CLIP_SECONDS
     num_clips = min(MAX_CLIPS, int(video_duration // clip_length))
@@ -225,7 +225,9 @@ def _segment_clips_heuristic(segments: list[TranscriptSegment], video_duration: 
                 type=CLIP_TYPE_CYCLE[i % len(CLIP_TYPE_CYCLE)],
                 start=start,
                 end=end,
-                hook_title=_derive_title(segments, start, end),
+                # No transcript (e.g. a silent/no-speech source): fall back to
+                # a numbered title instead of every clip being titled "Clip".
+                hook_title=_derive_title(segments, start, end) if segments else f"Clip {i + 1}",
             )
         )
     return clips
@@ -375,12 +377,15 @@ def run_pipeline(
         segments, language = _transcribe_with_whisper(
             source_path, duration_seconds, on_progress=_report_progress
         )
-        if not segments:
-            raise RuntimeError("No transcript segments were produced")
         video.language = language
 
         _report_progress("segmenting", SEGMENT_PROGRESS_AT)
-        video_duration = segments[-1]["end"]
+        # Always use the pre-probed source duration, not the last transcript
+        # segment's end time: Whisper's VAD can miss trailing speech (music,
+        # silence, a stretch with no dialogue), which would otherwise make
+        # the segmenter think the video ends early and skip real content
+        # after the last detected segment.
+        video_duration = duration_seconds
         proposed_clips = _segment_clips_heuristic(segments, video_duration)
 
         valid_clips = _validate_clips(proposed_clips, video_duration)

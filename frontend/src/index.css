@@ -1,12 +1,21 @@
 @import "tailwindcss";
 
+@theme {
+  --color-nflix-red: #e50914;
+  --color-nflix-red-dark: #b20710;
+  --color-nflix-black: #141414;
+  --color-nflix-surface: #1f1f1f;
+}
+
 :root {
-  color-scheme: light dark;
+  color-scheme: dark;
 }
 
 body {
   margin: 0;
   min-height: 100vh;
+  background: var(--color-nflix-black);
+  color: #fff;
 }
 
 @keyframes progress-shimmer {

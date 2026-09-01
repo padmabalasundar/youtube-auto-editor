@@ -7,15 +7,13 @@ interface LayoutProps {
 
 export const Layout = ({ children }: LayoutProps) => {
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100">
-      <header className="border-b border-gray-200 dark:border-gray-800">
-        <div className="mx-auto flex max-w-4xl items-center px-4 py-4">
-          <Link to="/" className="text-lg font-semibold">
-            YouTube Auto Editor
-          </Link>
-        </div>
+    <div className="min-h-screen bg-nflix-black text-white">
+      <header className="sticky top-0 z-10 bg-gradient-to-b from-black/80 to-transparent px-4 py-4 sm:px-8">
+        <Link to="/" className="text-2xl font-black tracking-tight text-nflix-red">
+          CLIPFLIX
+        </Link>
       </header>
-      <main className="mx-auto max-w-4xl px-4 py-8">{children}</main>
+      <main className="mx-auto max-w-6xl px-4 pb-16 sm:px-8">{children}</main>
     </div>
   );
 };

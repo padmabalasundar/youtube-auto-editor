@@ -5,12 +5,11 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 }
 
 const baseStyles =
-  'inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50';
+  'inline-flex items-center justify-center rounded px-5 py-2 text-sm font-semibold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50';
 
 const variantStyles: Record<NonNullable<ButtonProps['variant']>, string> = {
-  primary: 'bg-indigo-600 text-white hover:bg-indigo-700',
-  secondary:
-    'bg-gray-100 text-gray-900 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700',
+  primary: 'bg-nflix-red text-white hover:bg-nflix-red-dark',
+  secondary: 'bg-white/15 text-white hover:bg-white/25',
 };
 
 export const Button = ({ variant = 'primary', className = '', ...rest }: ButtonProps) => {

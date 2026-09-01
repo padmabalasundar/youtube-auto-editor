@@ -1,145 +1,132 @@
-# MicroSaaS Template
+# Video Auto Editor
 
-> **Clone. Define. Build.** Full-stack SaaS in minutes.
+> Upload a long video, get back short, captioned, vertical clips — automatically.
 
-This repo currently has `INITIAL.md` filled out for **Video Auto Editor** — a local MVP that converts an uploaded video file into 3–5 captioned short-form clips, with the pipeline running in the background and live progress in the UI. See `INITIAL.md` for the full spec, `PRPs/video-auto-editor-prp.md` for the implementation blueprint, and `CLAUDE.md` for this build's stack overrides (no auth, SQLite, no Docker — see "Current Build Override" section there).
+A local single-user MVP that turns an uploaded video into 3–5 short-form clips: it transcribes the audio, picks the best moments, and cuts each one into a 9:16 vertical clip with `ffmpeg`. No YouTube URL fetching, no login, no cloud dependency — everything runs on your own machine (or your own server).
 
----
-
-## Quick Start
-
-```bash
-# 1. Clone
-git clone https://github.com/manojkanur/MicroSaaS-Template-Private.git .
-cd my-saas
-
-# 2. Product is already defined in INITIAL.md (Video Auto Editor) and already
-# built — see "Run Locally" below. Edit INITIAL.md if you want to change scope,
-# then update PRPs/video-auto-editor-prp.md to match before extending the app.
-```
+Repo: https://github.com/padmabalasundar/youtube-auto-editor
 
 ---
 
-## What You Get (this build)
+## Features
 
-- FastAPI backend running the video pipeline (upload → local Whisper transcription → heuristic segmentation → `ffmpeg` cut/caption), pipeline runs on a background thread with live status/progress
-- React frontend: upload form, video list with live status, animated progress loader, clip player with hook titles
-- SQLite storage (no Postgres/migrations for this build — additive schema changes are patched in on startup instead)
-- No auth, no Docker, no CI, no LLM call — local MVP only
+- **Upload & forget** — drop in a video file; clip generation runs on a background thread while you watch live progress (transcribing → segmenting → cutting) from the UI.
+- **Local transcription** — [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (`small`, int8, CPU) transcribes the audio locally, no external API calls.
+- **Automatic clip selection** — a heuristic segmenter picks 3–5 evenly-spaced ~60s windows and cycles them through `summary` / `main idea` / `pain point & solution` slots, titled from their own transcript text.
+- **Vertical clips, ready to post** — each clip is cropped to 1080×1920 (9:16) via `ffmpeg`.
+- **Resilient pipeline** — a video with no detectable speech (silent source, or the whole track filtered out as non-speech) still produces evenly time-sliced clips instead of failing outright; a failed run can be retried from the already-uploaded source without re-uploading.
+- **Live status UI** — a dark, Netflix-inspired frontend: upload hero, a poster-grid of your videos with status badges, and an animated per-stage progress bar while a video processes.
+- **No accounts, no database server** — SQLite, schema created on startup, single local user. Nothing to configure before your first upload.
 
-*(The template also supports the full stack below for production SaaS builds — see `CLAUDE.md`'s override table for what's toggled off here.)*
+### Current limits
+
+- Transcription language is hardcoded to Tamil (`language="ta"` in `pipeline_service.py`) — change that constant to transcribe other languages.
+- Videos over 30 minutes or 1.5GB are rejected up front (`MAX_VIDEO_DURATION_SECONDS`, `MAX_UPLOAD_BYTES` in `backend/app/config.py` / `pipeline_service.py`).
+- Clip selection is a fixed-length heuristic, not an LLM pick — fast and free, but it doesn't understand content the way a model-based segmenter would.
+
+---
+
+## Tech Stack
+
+| Layer | Choice |
+|-------|--------|
+| Backend | FastAPI + Python 3.11+, SQLAlchemy + SQLite |
+| Frontend | React + TypeScript + Vite, Tailwind CSS |
+| Transcription | `faster-whisper` (CPU, int8) |
+| Video processing | `ffmpeg` / `ffprobe` |
+| Auth | None — local single-user MVP |
+
+See `CLAUDE.md` for the full rationale behind these choices (this build intentionally overrides the repo's template defaults — Postgres/JWT/Docker are the template's defaults for a future multi-tenant SaaS, not used here).
 
 ---
 
 ## How It Works
 
 ```
-INITIAL.md defines the product; PRPs/video-auto-editor-prp.md is the
-implementation blueprint for the app as it's actually built (already
-shipped — there's no scaffold-from-scratch step left to run).
-
-Modules:
-├─ Videos  → upload endpoint, background pipeline, list + detail pages
-└─ Clips   → embedded in the Video response, rendered inline per-clip
-
-Pipeline (per upload, on a background thread):
-transcribing (faster-whisper) → segmenting (heuristic) → cutting_clips (ffmpeg) → done
+Upload (POST /api/videos)
+        │
+        ▼
+  transcribing   — faster-whisper transcribes the audio locally
+        │
+        ▼
+  segmenting     — heuristic picks 3–5 clip windows across the video
+        │
+        ▼
+  cutting_clips  — ffmpeg cuts + crops each window to a 9:16 clip
+        │
+        ▼
+       done      — clips listed on the video's detail page
 ```
 
----
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `INITIAL.md` | Product spec — currently: Video Auto Editor MVP |
-| `PRPs/video-auto-editor-prp.md` | Implementation blueprint matching the shipped app |
-| `CLAUDE.md` | Project rules + this build's stack overrides |
-| `skills/*.md` | Code patterns (5 files) |
-| `agents/*.md` | Agent definitions |
-| `.claude/commands/` | Custom commands |
+The frontend polls `GET /api/videos/{id}` while a video is `pending`/`processing` to show live progress; clips and their metadata come back embedded in the video response once `status` is `done`.
 
 ---
 
-## Skills (5 files)
-
-| Skill | Contains |
-|-------|----------|
-| `BACKEND.md` | FastAPI + JWT + OAuth + Errors *(auth section unused this build)* |
-| `FRONTEND.md` | React + UI Kit + API integration |
-| `DATABASE.md` | SQLAlchemy + Alembic *(Alembic unused — SQLite, no migrations)* |
-| `TESTING.md` | pytest + Vitest |
-| `DEPLOYMENT.md` | Docker + GitHub Actions *(unused this build)* |
-
----
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `/setup-project` | Interactive wizard |
-| `/generate-prp` | Create implementation blueprint |
-| `/execute-prp` | Build with parallel agents |
-
----
-
-## Tech Stack
-
-**Template defaults:**
-- Backend: FastAPI + Python 3.11+
-- Frontend: React + TypeScript + Vite
-- Database: PostgreSQL + SQLAlchemy
-- Auth: JWT + Google OAuth
-- UI: Chakra UI or Tailwind + Framer Motion
-- Deploy: Docker + GitHub Actions
-
-**This build (Video Auto Editor MVP) overrides:**
-- Database: SQLite (no migrations)
-- Auth: none
-- Deploy: local only, no Docker
-- Adds: `faster-whisper`, `ffmpeg` for the video pipeline
-
----
-
-## Output Structure
+## Project Structure
 
 ```
-my-saas/
+.
 ├── backend/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── models/        # Video, Clip
-│   │   ├── routers/       # /api/videos
-│   │   ├── services/      # pipeline: transcribe, segment, cut, caption
-│   │   └── auth/          # unused this build
-│   └── tests/
+│   └── app/
+│       ├── main.py               # FastAPI app, CORS, static /output mount
+│       ├── config.py              # env-driven settings
+│       ├── models/                # Video, Clip (SQLAlchemy)
+│       ├── routers/videos.py      # upload / list / detail / retry
+│       └── services/pipeline_service.py   # transcribe → segment → cut
 ├── frontend/
 │   └── src/
-│       ├── components/
-│       ├── pages/          # / and /videos/{id}
-│       ├── hooks/
-│       └── services/
-├── output/                 # generated clips, per video_id
-└── app.db                  # SQLite, this build
+│       ├── pages/                 # HomePage (upload + list), VideoDetailPage
+│       ├── components/            # Button, Card, StatusBadge, ProgressLoader
+│       ├── hooks/useVideos.ts     # React Query hooks
+│       └── services/api.ts
+├── output/                        # generated clips + uploaded sources, per video
+└── app.db                         # SQLite database
 ```
 
 ---
 
 ## Run Locally
 
+**Prerequisites:** Python 3.11+, Node 18+, `ffmpeg`/`ffprobe` on your `PATH`.
+
 ```bash
-# Prerequisites (this build)
-brew install ffmpeg          # or apt-get install ffmpeg / choco install ffmpeg
+# ffmpeg
+brew install ffmpeg          # macOS
+# or: sudo apt-get install ffmpeg   (Ubuntu/Debian)
+# or: choco install ffmpeg         (Windows)
 
 # Backend
 cd backend
 pip install -r requirements.txt
+cp .env.example .env
 uvicorn app.main:app --reload
 
-# Frontend
+# Frontend (in a separate terminal)
 cd frontend
 npm install
+cp .env.example .env
 npm run dev
-
-# No Docker / docker-compose for this build
 ```
+
+The frontend runs at `http://localhost:5173` and talks to the backend at `http://localhost:8000` (`VITE_API_URL` in `frontend/.env`).
+
+---
+
+## Deployment
+
+There's no Docker setup for this build — it's designed to run as two lightweight local processes. To host it on your own server:
+
+- Serve the backend with `uvicorn` behind a process manager (e.g. a `systemd` unit), bound to `127.0.0.1`.
+- Build the frontend (`npm run build`) and serve the static `dist/` output directly from your reverse proxy.
+- Point an Nginx (or similar) server block at both: proxy `/api/` and `/output/` to the backend, serve everything else as static files, and terminate TLS with Let's Encrypt/Certbot.
+
+---
+
+## Documentation
+
+| File | Purpose |
+|------|---------|
+| `INITIAL.md` | Original product spec |
+| `PRPs/video-auto-editor-prp.md` | Implementation blueprint matching the shipped app |
+| `CLAUDE.md` | Project rules + this build's stack overrides |
+| `skills/*.md` | Backend/Frontend/Database/Testing/Deployment reference notes |
